@@ -1,0 +1,219 @@
+{% extends "base.html" %}
+{% block title %}{{ project.name }} -- procmon{% endblock %}
+{% block body %}
+<div class="topbar">
+  <div class="row"><span class="dot {{ project.status }}"></span><h1>{{ project.name }}</h1></div>
+  <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
+</div>
+
+<button type="button" class="primary" onclick="toggleNewProcess()" style="margin-bottom:14px;">+ New process</button>
+<div class="card" id="new-process-form" style="display:none; margin-bottom:14px;">
+  <form method="post" action="{{ url_for('create_process', project_id=project.id) }}">
+    <label for="name">Name</label>
+    <input type="text" id="name" name="name" required>
+    <label for="command">Command (full shell command line)</label>
+    <input type="text" id="command" name="command" placeholder="POMTRADER_ENV=dev python3 -m pomtrader.execution.scheduler" required>
+    <label for="working_dir">Working directory (optional)</label>
+    <input type="text" id="working_dir" name="working_dir">
+
+    <label>Run mode</label>
+    <div class="actions" style="margin-bottom:8px;">
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.95em; color:var(--text);">
+        <input type="radio" name="run_mode" value="perpetual" checked onchange="toggleRunMode()" style="width:auto;">
+        Perpetual (start it, keep it running -- auto-restarts if it crashes)
+      </label>
+    </div>
+    <div class="actions" style="margin-bottom:8px;">
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.95em; color:var(--text);">
+        <input type="radio" name="run_mode" value="scheduled" onchange="toggleRunMode()" style="width:auto;">
+        Scheduled (runs at specific times, or on demand -- never shows red, only green/amber)
+      </label>
+    </div>
+
+    <div id="perpetual-options">
+      <label><input type="checkbox" name="autostart" style="width:auto; display:inline;"> Autostart when procmon boots</label>
+    </div>
+
+    <div id="scheduled-options" style="display:none;">
+      <label for="schedule_cron">Schedule (cron format: minute hour day month weekday)</label>
+      <input type="text" id="schedule_cron" name="schedule_cron" placeholder="0 9 * * *  (9:00 AM every day)">
+      <div class="muted" style="margin-bottom:8px;">
+        Examples: <code>*/15 * * * *</code> every 15 minutes &middot;
+        <code>0 * * * *</code> every hour &middot;
+        <code>0 9 * * 1-5</code> 9 AM on weekdays &middot;
+        can also be run on demand anytime via "Run now", independent of this schedule
+      </div>
+    </div>
+
+    <button class="primary" type="submit" style="margin-top:8px;">Add process</button>
+  </form>
+</div>
+
+{% macro process_card(p) %}
+<div class="card">
+  <div class="row">
+    <div class="row">
+      <span class="dot {{ p.status }}" id="dot-{{ p.id }}"></span>
+      <div>
+        <div><strong>{{ p.name }}</strong></div>
+        <div class="command" onclick="this.classList.toggle('expanded')" title="Click to see the full command">{{ p.command }}</div>
+        {% if p.run_mode == "scheduled" %}
+          <div class="muted">scheduled: <code>{{ p.schedule_cron }}</code></div>
+        {% endif %}
+        {% if p.last_exit_code is not none %}
+          <div class="muted">last exit code: {{ p.last_exit_code }}</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="actions" style="margin-top:10px;">
+    {% if p.run_mode == "perpetual" %}
+    <form class="inline start-btn" id="start-btn-{{ p.id }}" method="post" action="{{ url_for('start_process_route', process_id=p.id) }}"
+          style="{{ 'display:none;' if p.status == 'green' else '' }}">
+      <button type="submit">Start</button>
+    </form>
+    <span class="running-btns" id="running-btns-{{ p.id }}" style="display:{{ 'contents' if p.status == 'green' else 'none' }};">
+      <form class="inline" method="post" action="{{ url_for('stop_process_route', process_id=p.id) }}">
+        <button type="submit">Stop</button>
+      </form>
+      <form class="inline" method="post" action="{{ url_for('restart_process_route', process_id=p.id) }}">
+        <button type="submit">Restart</button>
+      </form>
+    </span>
+    {% else %}
+    <form class="inline" method="post" action="{{ url_for('trigger_scheduled_process_route', process_id=p.id) }}">
+      <button type="submit">Run now</button>
+    </form>
+    <form class="inline" method="post" action="{{ url_for('stop_scheduled_process_route', process_id=p.id) }}">
+      <button type="submit">Stop</button>
+    </form>
+    {% endif %}
+    <button type="button" onclick="toggleEdit('{{ p.id }}')">Edit</button>
+    <button type="button" onclick="toggleLog('{{ p.id }}')">Logs</button>
+    <form class="inline" method="post" action="{{ url_for('delete_process_route', process_id=p.id) }}"
+          onsubmit="return confirm('Delete {{ p.name }}? This does not stop it first if running.');">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+  </div>
+
+  <div class="card" id="edit-{{ p.id }}" style="display:none; margin-top:10px;">
+    <form method="post" action="{{ url_for('edit_process_route', process_id=p.id) }}">
+      <label>Name</label>
+      <input type="text" name="name" value="{{ p.name }}" required>
+      <label>Command</label>
+      <input type="text" name="command" value="{{ p.command }}" required>
+      <label>Working directory</label>
+      <input type="text" name="working_dir" value="{{ p.working_dir or '' }}">
+      {% if p.run_mode == "perpetual" %}
+      <label><input type="checkbox" name="autostart" {% if p.autostart %}checked{% endif %} style="width:auto; display:inline;"> Autostart when procmon boots</label>
+      <div class="muted" style="margin-top:4px; margin-bottom:8px;">Command changes take effect on the next start/restart, not immediately.</div>
+      {% else %}
+      <label>Schedule (cron)</label>
+      <input type="text" name="schedule_cron" value="{{ p.schedule_cron or '' }}" required>
+      <div class="muted" style="margin-top:4px; margin-bottom:8px;">Saving re-registers the schedule immediately.</div>
+      {% endif %}
+      <button class="primary" type="submit">Save changes</button>
+    </form>
+  </div>
+
+  <pre class="log" id="log-{{ p.id }}" style="display:none; margin-top:10px;"></pre>
+</div>
+{% endmacro %}
+
+{% set perpetual_processes = project.processes | selectattr("run_mode", "equalto", "perpetual") | list %}
+{% set scheduled_processes = project.processes | selectattr("run_mode", "equalto", "scheduled") | list %}
+
+{% if perpetual_processes %}
+<h2 style="font-size:1em; margin-top:20px;">Perpetual</h2>
+{% for p in perpetual_processes %}{{ process_card(p) }}{% endfor %}
+{% endif %}
+
+{% if scheduled_processes %}
+<h2 style="font-size:1em; margin-top:20px;">Scheduled</h2>
+{% for p in scheduled_processes %}{{ process_card(p) }}{% endfor %}
+{% endif %}
+
+<form method="post" action="{{ url_for('delete_project', project_id=project.id) }}" style="margin-top:20px;"
+      onsubmit="return confirm('Delete project {{ project.name }}? All its processes must be stopped first.');">
+  <button type="submit" class="danger">Delete project</button>
+</form>
+
+<script>
+function toggleNewProcess() {
+  const el = document.getElementById("new-process-form");
+  el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+function toggleRunMode() {
+  const scheduled = document.querySelector('input[name="run_mode"][value="scheduled"]').checked;
+  document.getElementById("perpetual-options").style.display = scheduled ? "none" : "block";
+  document.getElementById("scheduled-options").style.display = scheduled ? "block" : "none";
+  document.getElementById("schedule_cron").required = scheduled;
+}
+
+function toggleEdit(processId) {
+  const el = document.getElementById("edit-" + processId);
+  el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+const openLogs = new Set();
+
+function toggleLog(processId) {
+  const el = document.getElementById("log-" + processId);
+  if (el.style.display === "none") {
+    el.style.display = "block";
+    openLogs.add(processId);
+    refreshLog(processId);
+  } else {
+    el.style.display = "none";
+    openLogs.delete(processId);
+  }
+}
+
+async function refreshLog(processId) {
+  if (!openLogs.has(processId)) return;
+  try {
+    const res = await fetch(`/processes/${processId}/logs?lines=200`);
+    const data = await res.json();
+    const el = document.getElementById("log-" + processId);
+    if (el) {
+      const wasAtBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+      el.textContent = data.log;
+      if (wasAtBottom) el.scrollTop = el.scrollHeight;
+    }
+  } catch (e) { /* silent */ }
+}
+
+async function refreshAllOpenLogs() {
+  for (const id of openLogs) await refreshLog(id);
+}
+setInterval(refreshAllOpenLogs, 3000);
+
+// Live-ish status polling -- updates each dot, AND shows/hides the
+// Start button vs. the Stop+Restart pair based on the freshly polled
+// status, so e.g. a perpetual process crashing while the page is open
+// correctly brings the Start button back without needing a manual
+// page reload.
+async function refreshStatuses() {
+  try {
+    const res = await fetch("{{ url_for('api_status') }}");
+    const projects = await res.json();
+    const thisProject = projects.find(p => p.id === "{{ project.id }}");
+    if (!thisProject) return;
+    thisProject.processes.forEach(p => {
+      const dot = document.getElementById("dot-" + p.id);
+      if (dot) dot.className = "dot " + p.status;
+
+      if (p.run_mode === "perpetual") {
+        const startBtn = document.getElementById("start-btn-" + p.id);
+        const runningBtns = document.getElementById("running-btns-" + p.id);
+        const isRunning = p.status === "green";
+        if (startBtn) startBtn.style.display = isRunning ? "none" : "";
+        if (runningBtns) runningBtns.style.display = isRunning ? "contents" : "none";
+      }
+    });
+  } catch (e) { /* silent */ }
+}
+setInterval(refreshStatuses, 5000);
+</script>
+{% endblock %}

@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}procmon{% endblock %}
+{% block body %}
+<div class="topbar">
+  <h1>procmon</h1>
+  <form method="post" action="{{ url_for('logout') }}"><button type="submit">Log out</button></form>
+</div>
+
+<button type="button" class="primary" onclick="toggleNewProject()" style="margin-bottom:14px;">+ New project</button>
+<div class="card" id="new-project-form" style="display:none; margin-bottom:14px;">
+  <form method="post" action="{{ url_for('create_project') }}">
+    <label for="name">Project name</label>
+    <input type="text" id="name" name="name" required>
+    <button class="primary" type="submit">Create</button>
+  </form>
+</div>
+
+<div id="projects">
+{% for project in projects %}
+  {% set perpetual = project.processes | selectattr("run_mode", "equalto", "perpetual") | list %}
+  {% set scheduled = project.processes | selectattr("run_mode", "equalto", "scheduled") | list %}
+  <div class="card" data-project-id="{{ project.id }}">
+    <a href="{{ url_for('project_detail', project_id=project.id) }}" style="display:block; text-decoration:none; color:inherit;">
+      <div style="display:flex; align-items:center;">
+        <span class="dot {{ project.status }}" id="project-dot-{{ project.id }}"></span>
+        <div style="font-size:1.1em;">{{ project.name }}</div>
+      </div>
+    </a>
+    {% if perpetual %}
+    <div style="margin-top:10px;">
+      <div class="muted" style="margin-bottom:4px;">Perpetual</div>
+      {% for p in perpetual %}
+        <div style="display:flex; align-items:center; margin-bottom:3px;">
+          <span class="dot {{ p.status }}" id="dot-{{ p.id }}" style="width:8px; height:8px; margin-right:6px;"></span>
+          <span style="font-size:0.9em;">{{ p.name }}</span>
+        </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if scheduled %}
+    <div style="margin-top:10px;">
+      <div class="muted" style="margin-bottom:4px;">Scheduled</div>
+      {% for p in scheduled %}
+        <div style="display:flex; align-items:center; margin-bottom:3px;">
+          <span class="dot {{ p.status }}" id="dot-{{ p.id }}" style="width:8px; height:8px; margin-right:6px;"></span>
+          <span style="font-size:0.9em;">{{ p.name }}</span>
+        </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if not perpetual and not scheduled %}
+      <div class="muted" style="margin-top:8px;">No processes yet</div>
+    {% endif %}
+  </div>
+{% endfor %}
+</div>
+
+<script>
+function toggleNewProject() {
+  const el = document.getElementById("new-project-form");
+  el.style.display = el.style.display === "none" ? "block" : "none";
+}
+
+// Live-ish status polling -- updates the project-level dot AND every
+// individual process dot within each card (both now carry real,
+// addressable ids), without a full page reload.
+async function refreshStatus() {
+  try {
+    const res = await fetch("{{ url_for('api_status') }}");
+    const projects = await res.json();
+    projects.forEach(proj => {
+      const projectDot = document.getElementById("project-dot-" + proj.id);
+      if (projectDot) projectDot.className = "dot " + proj.status;
+      proj.processes.forEach(p => {
+        const dot = document.getElementById("dot-" + p.id);
+        if (dot) dot.className = "dot " + p.status;
+      });
+    });
+  } catch (e) { /* silent -- a failed poll shouldn't disrupt the page */ }
+}
+setInterval(refreshStatus, 5000);
+</script>
+{% endblock %}

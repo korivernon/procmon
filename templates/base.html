@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>{% block title %}procmon{% endblock %}</title>
+
+<!-- PWA: standard manifest + install support (Android/Chrome, and most others) -->
+<link rel="manifest" href="/static/manifest.json">
+<meta name="theme-color" content="#0f1115">
+
+<!-- PWA: iOS-specific. Safari ignores manifest.json's own icon/display
+     settings almost entirely for "Add to Home Screen" -- these tags are
+     what actually control the iOS home-screen icon and standalone
+     (no browser chrome) display there. -->
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="procmon">
+
+<link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
+
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --border: #2a2f3a; --text: #e6e8eb; --muted: #8b94a3;
+    --green: #34c759; --red: #ff453a; --amber: #ff9f0a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; max-width: 720px; margin-inline: auto; line-height: 1.5;
+    /* Safe-area padding matters specifically in standalone PWA mode on iOS,
+       where there's no browser chrome to naturally clear the notch / home
+       indicator -- content can otherwise sit underneath them. Falls back to
+       the plain 16px on any browser/device without safe-area support at all. */
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+             max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  }
+  a { color: #6ea8fe; text-decoration: none; }
+  h1, h2 { margin: 0.4em 0; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; }
+  .dot.green { background: var(--green); }
+  .dot.red { background: var(--red); }
+  .dot.amber { background: var(--amber); }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px; margin-bottom: 12px;
+  }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .row > * {
+    min-width: 0;
+    /* Flexbox default -- flex items refuse to shrink below their content's
+       natural, unwrapped size (min-width: auto) unless told otherwise. That
+       silently defeats overflow/ellipsis truncation on anything nested
+       inside a .row, like the long, unbreakable command path on a process
+       card -- confirmed directly: without this, the command text overflows
+       the card and the whole page rather than truncating with "...". */
+  }
+  .muted { color: var(--muted); font-size: 0.85em; }
+  button, .btn {
+    background: #23262f; color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 14px; font-size: 0.9em; cursor: pointer;
+  }
+  button.primary { background: #2f6fed; border-color: #2f6fed; }
+  button.danger { background: #442; border-color: #a33; }
+  input, textarea {
+    background: #0d0f13; color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px; width: 100%; font-family: inherit; margin-bottom: 8px;
+  }
+  .command {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8em; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    cursor: pointer;
+  }
+  .command.expanded {
+    white-space: normal; word-break: break-all; overflow-wrap: break-word;
+  }
+  label { font-size: 0.85em; color: var(--muted); display: block; margin-bottom: 2px; }
+  pre.log {
+    background: #05060a; border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+    max-height: 400px; overflow-y: auto; font-size: 0.8em; white-space: pre-wrap; word-break: break-all;
+  }
+  form.inline { display: inline; }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+</style>
+</head>
+<body>
+{% block body %}{% endblock %}
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("/sw.js").catch((err) => {
+        // Non-fatal -- the app works fine without a service worker,
+        // this just means the install prompt may not appear on some
+        // browsers. Commonly fails over plain HTTP (most browsers
+        // require HTTPS or localhost for service workers) -- expected
+        // in that case, not a real error worth surfacing to the user.
+        console.log("Service worker registration failed (expected over plain HTTP):", err);
+      });
+    });
+  }
+</script>
+</body>
+</html>

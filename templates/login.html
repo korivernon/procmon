@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}procmon -- login{% endblock %}
+{% block body %}
+<div class="card" style="margin-top: 20vh;">
+  <h2>procmon</h2>
+  {% if error %}<p style="color: var(--red);">{{ error }}</p>{% endif %}
+  <form method="post">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" autofocus>
+    <button class="primary" type="submit" style="width:100%;">Log in</button>
+  </form>
+</div>
+{% endblock %}
