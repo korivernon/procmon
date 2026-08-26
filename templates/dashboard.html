@@ -23,7 +23,7 @@
     <a href="{{ url_for('project_detail', project_id=project.id) }}" style="display:block; text-decoration:none; color:inherit;">
       <div style="display:flex; align-items:center;">
         <span class="dot {{ project.status }}" id="project-dot-{{ project.id }}"></span>
-        <div style="font-size:1.1em;">{{ project.name }}</div>
+        <div style="font-size:1.4em; font-weight:700;">{{ project.name }}</div>
       </div>
     </a>
     {% if perpetual %}

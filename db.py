@@ -37,12 +37,26 @@ _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
 
 def init_db():
     """Creates the procmon schema and all tables if they don't already
-    exist. Safe to call on every app startup -- idempotent."""
+    exist. Safe to call on every app startup -- idempotent.
+
+    create_all() only creates missing TABLES, not missing columns on a
+    table that already exists -- so a new column added to models.py
+    after this schema was first created (e.g. awaiting_restart_
+    confirmation) needs its own explicit, idempotent ALTER TABLE here as
+    well. Not a real migration tool, just enough to keep an
+    already-populated table in sync with models.py without a manual
+    psql step."""
     with _engine.connect() as conn:
         conn.execute(text("CREATE SCHEMA IF NOT EXISTS procmon"))
         conn.commit()
     from procmon.models import Base
     Base.metadata.create_all(_engine)
+    with _engine.connect() as conn:
+        conn.execute(text(
+            "ALTER TABLE procmon.processes "
+            "ADD COLUMN IF NOT EXISTS awaiting_restart_confirmation BOOLEAN DEFAULT FALSE"
+        ))
+        conn.commit()
 
 
 @contextmanager

@@ -87,6 +87,13 @@ class Process(Base):
     last_stopped_at = Column(DateTime, nullable=True)
     last_exit_code = Column(Integer, nullable=True)
 
+    awaiting_restart_confirmation = Column(Boolean, default=False)  # set when a crash notification
+                                                                        # has been sent via photon-notif
+                                                                        # and a "reply YES to restart" is
+                                                                        # outstanding -- cleared as soon as
+                                                                        # the process is next successfully
+                                                                        # started, by whatever path does it
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="processes")

@@ -63,6 +63,15 @@
         {% if p.last_exit_code is not none %}
           <div class="muted">last exit code: {{ p.last_exit_code }}</div>
         {% endif %}
+        {% if p.last_started_at %}
+          <div class="muted">last started: <span class="local-time" data-iso="{{ p.last_started_at }}">{{ p.last_started_at }}</span></div>
+        {% endif %}
+        {% if p.last_stopped_at %}
+          <div class="muted">last stopped: <span class="local-time" data-iso="{{ p.last_stopped_at }}">{{ p.last_stopped_at }}</span></div>
+        {% endif %}
+        {% if p.awaiting_restart_confirmation %}
+          <div style="color:var(--red, #c0392b); font-weight:600; margin-top:2px;">Crashed -- Start below to restart it</div>
+        {% endif %}
       </div>
     </div>
   </div>
@@ -139,6 +148,14 @@
 </form>
 
 <script>
+// last_started_at/last_stopped_at are stored and rendered server-side as
+// UTC ISO timestamps -- swap them for the browser's own local time here
+// rather than making the server guess the viewer's timezone.
+document.querySelectorAll(".local-time").forEach(el => {
+  const d = new Date(el.dataset.iso + "Z");
+  if (!isNaN(d)) el.textContent = d.toLocaleString();
+});
+
 function toggleNewProcess() {
   const el = document.getElementById("new-process-form");
   el.style.display = el.style.display === "none" ? "block" : "none";

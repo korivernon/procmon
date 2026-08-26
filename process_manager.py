@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 import signal
 import subprocess
 import time
@@ -43,7 +42,30 @@ logger = logging.getLogger(__name__)
 GRACEFUL_STOP_TIMEOUT_SECONDS = 10
 
 
-def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_path: str) -> tuple[int, str]:
+def _duplicate_marker(process_id: str) -> str:
+    """
+    A shell no-op prefix embedding process_id, prepended to a process's
+    command before it's actually run. Exists purely so kill_duplicate_
+    processes() can later find a still-running instance of THIS EXACT
+    process definition precisely -- reading another process's environ()
+    to tag it there instead was tried first and confirmed NOT to work
+    unprivileged on macOS (returns empty even for a same-user child), so
+    the marker has to live somewhere psutil CAN reliably read for any
+    process -- its own argv, via cmdline().
+
+    The leading ": <marker> ;" also has a second, required effect: it
+    forces the shell to actually stay alive as a wrapper around the
+    real command rather than exec-replacing itself with it (which shells
+    do for a single simple command with nothing else in the script --
+    confirmed directly, not assumed). Losing the wrapper would lose the
+    marker along with it, since an exec-replaced process's argv becomes
+    the target command's own, with no room left for the marker at all.
+    """
+    return f": PROCMON_ID_{process_id} ;"
+
+
+def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_path: str,
+                   process_id: str) -> tuple[int, str]:
     """
     Spawns the given shell command, redirecting stdout+stderr to
     log_path (appended, not truncated -- restarting a process shouldn't
@@ -69,6 +91,16 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
     this tool assumes whoever can reach it is already trusted to run
     arbitrary commands on this machine, the same trust level as having
     a terminal open on it.
+
+    process_id is procmon's own DB id for this process definition --
+    embedded (via _duplicate_marker) as a harmless leading no-op in the
+    actual command run, purely so a LATER call to kill_duplicate_
+    processes(process_id) can recognize and clean up THIS specific
+    still-running instance if this process definition gets started
+    again while an old instance is unexpectedly still alive (e.g.
+    procmon itself restarted and lost track of it). ":" is a shell
+    builtin that does nothing and produces no output, so this doesn't
+    change what the command actually does or logs.
     """
     log_dir = os.path.dirname(log_path)
     if log_dir:
@@ -77,10 +109,12 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
     full_env = dict(os.environ)
     full_env.update(env_vars or {})
 
+    wrapped_command = f"{_duplicate_marker(process_id)} {command}"
+
     log_file = open(log_path, "a")
     try:
         proc = subprocess.Popen(
-            command,
+            wrapped_command,
             shell=True,
             cwd=working_dir or None,
             env=full_env,
@@ -115,6 +149,65 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
                             "in the brief window between the poll() check above and this line")
 
     return proc.pid, str(create_time)
+
+
+def kill_duplicate_processes(process_id: str, exclude_pid: Optional[int] = None) -> list[int]:
+    """
+    Finds and force-kills any OS process previously started (via
+    start_process, below) for this exact process_id that's still
+    running -- meant to be called right BEFORE start_process() spawns a
+    new instance of it, so an old instance left running after procmon
+    itself lost track of it (e.g. across a procmon restart, which
+    forgets in-memory/DB-row state but doesn't touch already-running
+    child processes) doesn't end up duplicated alongside the new one
+    about to be spawned.
+
+    Matching is via the marker start_process() embeds in the process's
+    own argv (_duplicate_marker/cmdline()), NOT by comparing raw command
+    text -- an earlier version of this function matched by command text
+    and was confirmed, by direct testing, to have a real false-positive
+    risk: a compound command's internal step (e.g. the "sleep 30" part
+    of "sleep 30 && echo done") can produce a process whose own argv is
+    indistinguishable from an unrelated simple "sleep 30" command. The
+    marker's per-process_id uniqueness avoids that entirely -- this can
+    only ever match a process procmon itself started for this specific
+    process definition, never an unrelated one, and never one started
+    outside procmon at all (which is a deliberate, safer scope: catching
+    procmon's own orphaned instances, not guessing at arbitrary
+    processes on the system that merely look similar).
+
+    Returns the pids actually killed, purely for logging -- callers
+    don't need to do anything else with them.
+    """
+    marker = _duplicate_marker(process_id)
+    own_pid = os.getpid()
+    killed = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        if proc.pid in (exclude_pid, own_pid):
+            continue
+        try:
+            cmdline = proc.info["cmdline"] or []
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+        if len(cmdline) < 3 or cmdline[1] != "-c" or not cmdline[2].startswith(marker):
+            continue
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            killed.append(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+    if killed:
+        time.sleep(0.3)
+        for pid in killed:
+            try:
+                if psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, psutil.NoSuchProcess):
+                pass
+    return killed
 
 
 def is_actually_running(pid: Optional[int], expected_create_time: Optional[str]) -> bool:
@@ -347,9 +440,22 @@ def compute_process_status(run_mode: str, desired_state: str, pid: Optional[int]
 
 def compute_project_status(process_statuses: list[str]) -> str:
     """
-    green: every process green. red: every process red (or no processes
-    at all -- an empty project has nothing green to report). amber: a
-    genuine mix of both.
+    green: every process green, OR a mix of green and amber with no red
+    at all -- amber alone (a scheduled job that hasn't proven itself yet,
+    or is simply idle between runs) isn't a real problem, so it
+    shouldn't drag an otherwise-healthy project down to a warning
+    color. red: every process red (or no processes at all -- an empty
+    project has nothing green to report). amber: red is present
+    alongside anything else (not ALL red) -- red is what actually
+    signals a real problem here, e.g. a green process running fine
+    next to a crashed one.
+
+    An all-amber project (no green, no red at all -- e.g. every
+    scheduled job present has simply never run yet) deliberately stays
+    amber rather than being promoted to green: nothing here has
+    actually proven itself working, so "everything's fine" would be
+    overstating it. Only promoted to green when there's at least one
+    confirmed-green process alongside the amber ones.
     """
     if not process_statuses:
         return "red"
@@ -357,6 +463,11 @@ def compute_project_status(process_statuses: list[str]) -> str:
         return "green"
     if all(s == "red" for s in process_statuses):
         return "red"
+
+    has_red = any(s == "red" for s in process_statuses)
+    has_green = any(s == "green" for s in process_statuses)
+    if not has_red and has_green:
+        return "green"
     return "amber"
 
 

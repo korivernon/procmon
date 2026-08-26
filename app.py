@@ -53,10 +53,34 @@
 #   FLASK_SECRET_KEY       -- required for session cookies to be secure;
 #                              generate one with: python3 -c "import secrets; print(secrets.token_hex(32))"
 #   PROCMON_DATABASE_URL   -- optional, see db.py for the default
+#   PROCMON_BASE_URL       -- optional, used to build the link sent in a crash
+#                              notification (e.g. "https://procmon.example.com");
+#                              defaults to http://127.0.0.1:$PROCMON_PORT, which
+#                              is only reachable from this machine itself
+#
+#   Crash notifications via photon-notif (photon-notif/ here is a symlink
+#   to pomtrader's own photon-notif -- the same Spectrum iMessage relay,
+#   same phone line, shared with pomtrader's ai_gerry trade-approval
+#   texts). All optional; if PROCMON_NOTIFY_PHONE or PHOTON_SHARED_SECRET
+#   is unset, crash notifications are silently skipped (auto-restart /
+#   crash-loop backoff below still work exactly as before, just without a
+#   text). The text is informational only (process name + a link to its
+#   page) -- deliberately no "reply to restart" action, since that would
+#   collide with pomtrader's own reply-driven approval flow on the same
+#   shared line; restarting a crashed process is a click on the page the
+#   link points to, not a text reply.
+#   PROCMON_NOTIFY_PHONE   -- phone number (or handle) to text on a crash
+#   PHOTON_NOTIF_URL       -- optional, defaults to http://127.0.0.1:8790
+#   PHOTON_SHARED_SECRET   -- must match photon-notif/.env's own copy;
+#                              authenticates the outbound /send call
+#   PROCMON_NOTIFY_EMAIL   -- also email this address on a crash (see
+#                              emailer.py -- an independent channel for
+#                              when photon-notif is itself down)
 # ----------------------------------------------------------------------------
 
 from __future__ import annotations
 
+import logging
 import os
 
 try:
@@ -74,6 +98,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 
+from procmon import emailer
+from procmon import photon_client
 from procmon import process_manager as pm
 from procmon.auth import check_password, login_required
 from procmon.db import get_session, init_db
@@ -91,7 +117,59 @@ RECONCILE_INTERVAL_SECONDS = 15
 CRASH_LOOP_WINDOW_MINUTES = 5
 CRASH_LOOP_THRESHOLD = 3  # this many crashes within the window above -> stop auto-restarting
 
+PROCMON_BASE_URL = os.environ.get("PROCMON_BASE_URL", f"http://127.0.0.1:{os.environ.get('PROCMON_PORT', 8600)}").rstrip("/")
+PROCMON_NOTIFY_PHONE = os.environ.get("PROCMON_NOTIFY_PHONE", "")
+
+logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
+
+
+def _process_page_link(project_id: str) -> str:
+    with app.app_context():
+        return PROCMON_BASE_URL + url_for("project_detail", project_id=project_id)
+
+
+def _notify_crash(process: Process, project_name: str) -> None:
+    """
+    Texts PROCMON_NOTIFY_PHONE via photon-notif that a process crashed,
+    with a link to its project page -- informational only, no reply
+    action. (photon-notif is a single shared relay/phone line also used
+    by pomtrader's own trade-approval "reply YES" flow -- adding a second,
+    competing reply-driven flow on the same line would make an inbound
+    "Yes" ambiguous between "approve this trade" and "restart this
+    process", so restarting is a deliberate, separate step taken on the
+    page this links to, not a text reply.)
+
+    Also emails PROCMON_NOTIFY_EMAIL (via emailer.py) with the same
+    content. The two channels are attempted independently -- the email
+    exists precisely for the case where the text can't go out because
+    photon-notif is itself among the crashed processes, so a failure in
+    one must never suppress the other.
+
+    Called from the reconciliation loop (a background thread, not a
+    Flask request), which is why the link is built via app_context()
+    rather than relying on an ambient request. Silently does nothing if
+    notifications aren't configured -- this must never be the reason
+    the reconcile loop itself breaks, so any failure is only logged.
+    """
+    link = _process_page_link(process.project_id)
+    text = f"\U0001F534 {process.name} ({project_name}) crashed.\n\nRestart it here: {link}"
+
+    if PROCMON_NOTIFY_PHONE and photon_client.PHOTON_SHARED_SECRET:
+        try:
+            photon_client.send_imessage(PROCMON_NOTIFY_PHONE, text)
+        except Exception as e:
+            logger.error("Failed to send crash text for %s: %s", process.name, e)
+
+    if emailer.PROCMON_NOTIFY_EMAIL:
+        try:
+            emailer.send_email(
+                emailer.PROCMON_NOTIFY_EMAIL,
+                f"[procmon] {process.name} ({project_name}) crashed",
+                text,
+            )
+        except Exception as e:
+            logger.error("Failed to send crash email for %s: %s", process.name, e)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +227,7 @@ def _project_view_data(session_db, project: Project) -> dict:
             "last_exit_code": p.last_exit_code,
             "last_started_at": p.last_started_at.isoformat() if p.last_started_at else None,
             "last_stopped_at": p.last_stopped_at.isoformat() if p.last_stopped_at else None,
+            "awaiting_restart_confirmation": p.awaiting_restart_confirmation,
         })
     return {
         "id": project.id, "name": project.name,
@@ -344,8 +423,13 @@ def start_process_route(process_id):
         if _process_status(process) == "green":
             return redirect(url_for("project_detail", project_id=process.project_id))
 
+        killed = pm.kill_duplicate_processes(process.id, exclude_pid=process.pid)
+        if killed:
+            db.add(ProcessEvent(process_id=process.id, event_type="stopped",
+                                 detail=f"killed {len(killed)} duplicate process(es) already running this command: {killed}"))
+
         try:
-            pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path)
+            pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path, process.id)
         except Exception as e:
             db.add(ProcessEvent(process_id=process.id, event_type="restart_failed", detail=str(e)))
             return redirect(url_for("project_detail", project_id=process.project_id))
@@ -354,6 +438,7 @@ def start_process_route(process_id):
         process.process_start_time = create_time
         process.desired_state = "running"
         process.last_started_at = _now()
+        process.awaiting_restart_confirmation = False
         db.add(ProcessEvent(process_id=process.id, event_type="started", detail=f"pid={pid}"))
         project_id = process.project_id
     return redirect(url_for("project_detail", project_id=project_id))
@@ -439,6 +524,8 @@ def stop_process_route(process_id):
                                               # the stop itself doesn't get logged as an unexpected crash
         stopped_cleanly = pm.stop_process(process.pid, process.process_start_time)
         process.last_stopped_at = _now()
+        process.awaiting_restart_confirmation = False  # a deliberate stop resolves any outstanding
+                                                            # crash prompt from before
         if stopped_cleanly:
             process.pid = None
             process.process_start_time = None
@@ -563,8 +650,16 @@ def _autostart_processes():
         for process in to_start:
             if _process_status(process) == "green":
                 continue
+            # procmon itself restarting forgets its in-memory state, but doesn't touch
+            # already-running child processes (they're their own session group) -- so an
+            # old instance from the PREVIOUS procmon run can still be alive here even
+            # though the DB no longer shows it as green. Clear that duplicate first.
+            killed = pm.kill_duplicate_processes(process.id, exclude_pid=process.pid)
+            if killed:
+                db.add(ProcessEvent(process_id=process.id, event_type="stopped",
+                                     detail=f"killed {len(killed)} duplicate process(es) already running this command: {killed}"))
             try:
-                pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path)
+                pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path, process.id)
                 process.pid = pid
                 process.process_start_time = create_time
                 process.desired_state = "running"
@@ -637,6 +732,14 @@ def _reconcile_loop():
                         detail=f"detected during routine health check -- pid {process.pid} no longer running",
                     ))
 
+                    if not process.awaiting_restart_confirmation:
+                        # only the FIRST crash of a given crash-cycle sends a text -- this loop
+                        # re-detects "not running" every RECONCILE_INTERVAL_SECONDS until either a
+                        # restart succeeds or the crash-loop backoff kicks in below, and neither of
+                        # those should mean re-texting every 15 seconds forever
+                        process.awaiting_restart_confirmation = True
+                        _notify_crash(process, process.project.name)
+
                     if _recent_crash_count(db, process.id) >= CRASH_LOOP_THRESHOLD:
                         if not _recently_abandoned(db, process.id):
                             db.add(ProcessEvent(
@@ -646,11 +749,16 @@ def _reconcile_loop():
                             ))
                         continue  # desired_state stays "running" -- correctly stays red, not silently "fine"
 
+                    killed = pm.kill_duplicate_processes(process.id, exclude_pid=process.pid)
+                    if killed:
+                        db.add(ProcessEvent(process_id=process.id, event_type="stopped",
+                                             detail=f"killed {len(killed)} duplicate process(es) already running this command: {killed}"))
                     try:
-                        pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path)
+                        pid, create_time = pm.start_process(process.command, process.working_dir, process.env_vars or {}, process.log_path, process.id)
                         process.pid = pid
                         process.process_start_time = create_time
                         process.last_started_at = _now()
+                        process.awaiting_restart_confirmation = False
                         db.add(ProcessEvent(process_id=process.id, event_type="started", detail=f"auto-restart after crash, pid={pid}"))
                     except Exception as e:
                         db.add(ProcessEvent(process_id=process.id, event_type="restart_failed", detail=f"auto-restart failed: {e}"))

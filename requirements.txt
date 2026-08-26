@@ -4,3 +4,5 @@ psycopg2-binary
 psutil
 apscheduler
 python-dotenv
+requests
+cryptography
