@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -243,6 +244,70 @@ def is_actually_running(pid: Optional[int], expected_create_time: Optional[str])
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return False
     return abs(actual_create_time - float(expected_create_time)) < 1.0
+
+
+def find_running_instance(command: str, exclude_pid: Optional[int] = None) -> Optional[tuple[int, str]]:
+    """
+    Looks for an OS process that's already actually running this exact
+    command, even though procmon's own stored (pid, create_time) for it
+    is missing or stale -- used to ADOPT a process that's alive but not
+    currently tracked (started manually outside procmon entirely, or
+    left running from a previous procmon session whose in-memory
+    tracking is gone) rather than either leaving status incorrectly red
+    or spawning a genuine duplicate alongside it next time someone hits
+    Start.
+
+    Matches directly on the command's own argv (NOT the process_id
+    marker kill_duplicate_processes() looks for) -- adoption is
+    non-destructive, it only ever records a pid, never signals
+    anything, so the small false-positive risk of a plain command-text
+    match (confirmed real for kill_duplicate_processes, see its own
+    docstring) is an acceptable trade here, unlike for that function.
+    Checks both shapes shell=True can produce: the shell-wrapper form
+    (argv == [shell, "-c", command]) or the exec-replaced form (argv ==
+    the command's own split argv) -- see start_process()'s docstring
+    for why shell=True can produce either.
+
+    A process procmon itself started (marker-prefixed, see
+    _duplicate_marker) deliberately does NOT match either shape here --
+    its argv is "sh -c : PROCMON_ID_... ; command", not a plain match.
+    That's intentional, not a gap: an orphaned procmon-started instance
+    is already handled correctly by kill_duplicate_processes() at the
+    next start (killed, then replaced by a fresh instance) -- adopting
+    a possibly-stale old instance instead would be a worse outcome than
+    that already-correct path.
+
+    Returns (pid, create_time_str) of the first live match found, or
+    None.
+    """
+    try:
+        target_argv = shlex.split(command)
+    except ValueError:
+        target_argv = None  # unbalanced quotes etc -- exec-replaced form just won't match;
+                                # the shell-wrapper form (an exact string compare) still can
+
+    own_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        if proc.pid in (exclude_pid, own_pid):
+            continue
+        try:
+            cmdline = proc.info["cmdline"] or []
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+        is_shell_wrapper = len(cmdline) == 3 and cmdline[1] == "-c" and cmdline[2] == command
+        is_exec_replaced = target_argv is not None and cmdline == target_argv
+        if not (is_shell_wrapper or is_exec_replaced):
+            continue
+
+        try:
+            create_time = proc.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        return proc.pid, str(create_time)
+    return None
 
 
 def stop_process(pid: Optional[int], expected_create_time: Optional[str], reap: bool = True) -> bool:
@@ -469,6 +534,46 @@ def compute_project_status(process_statuses: list[str]) -> str:
     if not has_red and has_green:
         return "green"
     return "amber"
+
+
+def rotate_log_if_needed(log_path: str, max_bytes: int = 50 * 1024 * 1024,
+                          keep_bytes: int = 5 * 1024 * 1024) -> bool:
+    """
+    In-place capped rotation for a process's captured stdout/stderr log.
+    When the file exceeds max_bytes, the last keep_bytes are preserved
+    to "<log_path>.1" (overwriting any previous rotation) and the live
+    file is truncated to zero. Returns True if a rotation happened.
+
+    Why truncate-in-place instead of the classic rename-and-reopen:
+    the monitored child process holds an already-open fd to this exact
+    file, opened in APPEND mode by start_process()/run_one_shot() --
+    renaming would leave the child writing to the renamed file forever,
+    growing it unbounded exactly as before. Truncating the file the
+    child already has open is safe *specifically because* the fd is
+    O_APPEND: every subsequent write atomically seeks to the (now
+    reset) end of file, so nothing is lost and no sparse gap forms.
+
+    This exists because it was a real incident, not hygiene: one
+    process's captured log grew to 1.3 GB unrotated and helped push
+    the disk to 98% full -- and a full disk takes down Postgres and
+    every monitored app at once, the exact cascade a process monitor
+    is supposed to prevent.
+    """
+    try:
+        if not os.path.exists(log_path) or os.path.getsize(log_path) <= max_bytes:
+            return False
+        with open(log_path, "rb") as f:
+            f.seek(-keep_bytes, os.SEEK_END)
+            tail = f.read()
+        with open(log_path + ".1", "wb") as f:
+            f.write(tail)
+        with open(log_path, "r+b") as f:
+            f.truncate(0)
+        logger.info("rotated %s (kept last %d bytes in %s.1)", log_path, keep_bytes, log_path)
+        return True
+    except OSError as e:
+        logger.warning("log rotation failed for %s: %s", log_path, e)
+        return False
 
 
 def tail_log(log_path: str, lines: int = 200) -> str:

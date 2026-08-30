@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Usage -- procmon{% endblock %}
+{% block body %}
+<div class="topbar">
+  <h1>Usage</h1>
+  <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
+</div>
+
+<div class="muted" style="margin-bottom:12px;">
+  Data generated per process -- log file growth for every process, plus Postgres table growth for any
+  process tagged with its own tables (edit a process to add tags). Sorted by the last 24 hours.
+</div>
+
+<div class="actions" style="margin-bottom:14px;">
+  <button type="button" class="window-btn" data-window="24h">24h</button>
+  <button type="button" class="window-btn" data-window="7d">7d</button>
+  <button type="button" class="window-btn" data-window="30d">30d</button>
+</div>
+
+<div id="rows"><div class="muted">Loading&hellip;</div></div>
+
+<style>
+  .usage-row { cursor: pointer; }
+  .usage-row:hover { border-color: #3a4152; }
+  .usage-cols { display:flex; justify-content: space-between; align-items:center; gap:10px; }
+  .usage-name { font-weight: 600; }
+  .usage-bytes { text-align:right; font-variant-numeric: tabular-nums; white-space:nowrap; }
+  .usage-bytes .muted { font-size: 0.75em; }
+  .window-btn { }
+  .window-btn.active { background: #2f6fed; border-color: #2f6fed; }
+  .chart-wrap { margin-top: 10px; display:none; }
+  .chart-legend { display:flex; gap:14px; margin-top:6px; font-size:0.8em; }
+  .legend-swatch { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+</style>
+
+<script>
+const WINDOWS = ["24h", "7d", "30d"];
+let currentWindow = "24h";
+let summaryCache = null;
+const openCharts = new Set();
+
+function formatBytes(n) {
+  if (n === null || n === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return i === 0 ? `${Math.round(v)}B` : `${v.toFixed(1)}${units[i]}`;
+}
+
+function setWindow(w) {
+  currentWindow = w;
+  document.querySelectorAll(".window-btn").forEach(b => b.classList.toggle("active", b.dataset.window === w));
+  renderRows();
+}
+
+async function loadSummary() {
+  const res = await fetch("{{ url_for('api_usage_summary') }}");
+  summaryCache = await res.json();
+  renderRows();
+}
+
+function renderRows() {
+  const container = document.getElementById("rows");
+  if (!summaryCache) return;
+  if (summaryCache.length === 0) {
+    container.innerHTML = '<div class="muted">No usage samples yet -- the tracker samples every 5 minutes, check back shortly.</div>';
+    return;
+  }
+  const sorted = [...summaryCache].sort((a, b) => {
+    const ta = a.windows[currentWindow].log_bytes + (a.windows[currentWindow].db_bytes || 0);
+    const tb = b.windows[currentWindow].log_bytes + (b.windows[currentWindow].db_bytes || 0);
+    return tb - ta;
+  });
+  container.innerHTML = "";
+  for (const row of sorted) {
+    const w = row.windows[currentWindow];
+    const el = document.createElement("div");
+    el.className = "card usage-row";
+    el.innerHTML = `
+      <div class="usage-cols">
+        <div>
+          <div class="usage-name">${row.process_name}</div>
+          <div class="muted">${row.project_name}</div>
+        </div>
+        <div class="usage-bytes">
+          <div>${formatBytes(w.log_bytes)} logs${row.db_tagged ? ' &middot; ' + formatBytes(w.db_bytes) + ' db' : ''}</div>
+          <div class="muted">${row.db_tagged ? '' : 'db not tagged'}</div>
+        </div>
+      </div>
+      <div class="chart-wrap" id="chart-${row.process_id}"></div>
+    `;
+    el.addEventListener("click", () => toggleChart(row.process_id, row.process_name));
+    container.appendChild(el);
+  }
+}
+
+async function toggleChart(processId, processName) {
+  const wrap = document.getElementById(`chart-${processId}`);
+  if (!wrap) return;
+  if (openCharts.has(processId)) {
+    wrap.style.display = "none";
+    openCharts.delete(processId);
+    return;
+  }
+  openCharts.add(processId);
+  wrap.style.display = "block";
+  wrap.innerHTML = '<div class="muted">Loading chart&hellip;</div>';
+
+  const hours = currentWindow === "24h" ? 24 : currentWindow === "7d" ? 24 * 7 : 24 * 30;
+  try {
+    const res = await fetch(`/processes/${processId}/usage-series?hours=${hours}`);
+    const data = await res.json();
+    wrap.innerHTML = renderChart(data.samples, data.db_tagged);
+  } catch (e) {
+    wrap.innerHTML = '<div class="muted">Could not load chart.</div>';
+  }
+}
+
+function renderChart(samples, dbTagged) {
+  if (!samples || samples.length === 0) {
+    return '<div class="muted">No samples in this window yet.</div>';
+  }
+  const width = 640, height = 140, padding = 6;
+  const logVals = samples.map(s => s.log_bytes_delta);
+  const dbVals = samples.map(s => s.db_bytes_delta);
+  const maxVal = Math.max(1, ...logVals, ...(dbTagged ? dbVals : []));
+
+  const toPoints = (vals) => vals.map((v, i) => {
+    const x = padding + (i / Math.max(1, vals.length - 1)) * (width - padding * 2);
+    const y = height - padding - (v / maxVal) * (height - padding * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+
+  const logLine = `<polyline fill="none" stroke="#6ea8fe" stroke-width="1.5" points="${toPoints(logVals)}" />`;
+  const dbLine = dbTagged
+    ? `<polyline fill="none" stroke="#34c759" stroke-width="1.5" points="${toPoints(dbVals)}" />`
+    : "";
+
+  return `
+    <svg viewBox="0 0 ${width} ${height}" style="width:100%; height:auto; background:#05060a; border:1px solid var(--border); border-radius:8px;">
+      ${logLine}${dbLine}
+    </svg>
+    <div class="chart-legend">
+      <span><span class="legend-swatch" style="background:#6ea8fe;"></span>log bytes / sample</span>
+      ${dbTagged ? '<span><span class="legend-swatch" style="background:#34c759;"></span>db bytes / sample</span>' : '<span class="muted">db not tagged for this process</span>'}
+    </div>
+  `;
+}
+
+document.querySelectorAll(".window-btn").forEach(b => b.addEventListener("click", () => setWindow(b.dataset.window)));
+setWindow("24h");
+loadSummary();
+setInterval(loadSummary, 30000);
+</script>
+{% endblock %}

@@ -3,7 +3,10 @@
 {% block body %}
 <div class="topbar">
   <div class="row"><span class="dot {{ project.status }}"></span><h1>{{ project.name }}</h1></div>
-  <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
+  <div class="actions">
+    <a href="{{ url_for('usage_dashboard') }}" class="btn">Usage</a>
+    <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
+  </div>
 </div>
 
 <button type="button" class="primary" onclick="toggleNewProcess()" style="margin-bottom:14px;">+ New process</button>
@@ -15,6 +18,12 @@
     <input type="text" id="command" name="command" placeholder="POMTRADER_ENV=dev python3 -m pomtrader.execution.scheduler" required>
     <label for="working_dir">Working directory (optional)</label>
     <input type="text" id="working_dir" name="working_dir">
+    <label for="db_tables">Postgres tables this process owns (optional, comma-separated)</label>
+    <input type="text" id="db_tables" name="db_tables" placeholder="pomtrader.executions, pomtrader.positions">
+    <div class="muted" style="margin-bottom:8px;">
+      Powers the usage tracker's DB-growth attribution for this process -- see <a href="{{ url_for('usage_dashboard') }}">Usage</a>.
+      Leave blank if this process doesn't write to Postgres, or you don't want its DB growth tracked.
+    </div>
 
     <label>Run mode</label>
     <div class="actions" style="margin-bottom:8px;">
@@ -72,6 +81,7 @@
         {% if p.awaiting_restart_confirmation %}
           <div style="color:var(--red, #c0392b); font-weight:600; margin-top:2px;">Crashed -- Start below to restart it</div>
         {% endif %}
+        <div class="muted">last 24h: {{ p.log_bytes_24h }} logs{% if p.db_bytes_24h %} &middot; {{ p.db_bytes_24h }} db{% endif %}</div>
       </div>
     </div>
   </div>
@@ -113,6 +123,8 @@
       <input type="text" name="command" value="{{ p.command }}" required>
       <label>Working directory</label>
       <input type="text" name="working_dir" value="{{ p.working_dir or '' }}">
+      <label>Postgres tables this process owns (comma-separated)</label>
+      <input type="text" name="db_tables" value="{{ p.db_tables }}" placeholder="pomtrader.executions, pomtrader.positions">
       {% if p.run_mode == "perpetual" %}
       <label><input type="checkbox" name="autostart" {% if p.autostart %}checked{% endif %} style="width:auto; display:inline;"> Autostart when procmon boots</label>
       <div class="muted" style="margin-top:4px; margin-bottom:8px;">Command changes take effect on the next start/restart, not immediately.</div>

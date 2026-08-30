@@ -3,7 +3,10 @@
 {% block body %}
 <div class="topbar">
   <h1>procmon</h1>
-  <form method="post" action="{{ url_for('logout') }}"><button type="submit">Log out</button></form>
+  <div class="actions">
+    <a href="{{ url_for('usage_dashboard') }}" class="btn">Usage</a>
+    <form method="post" action="{{ url_for('logout') }}"><button type="submit">Log out</button></form>
+  </div>
 </div>
 
 <button type="button" class="primary" onclick="toggleNewProject()" style="margin-bottom:14px;">+ New project</button>

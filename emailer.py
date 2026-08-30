@@ -95,16 +95,22 @@ def _smtp_settings() -> dict:
 
 
 def send_email(to_address: str, subject: str, body: str) -> None:
+    # to_address may be a single address or a "," / ";" separated list (e.g.
+    # PROCMON_NOTIFY_EMAIL="a@x.com,b@y.com") -- split it out so each name
+    # actually lands in the SMTP envelope's RCPT TO instead of being sent as
+    # one malformed combined address.
+    recipients = [addr.strip() for addr in to_address.replace(";", ",").split(",") if addr.strip()]
+
     settings = _smtp_settings()
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = settings["from_email"]
-    msg["To"] = to_address
+    msg["To"] = ", ".join(recipients)
 
     try:
         with smtplib.SMTP(settings["host"], settings["port"], timeout=15) as server:
             server.starttls()
             server.login(settings["username"], settings["password"])
-            server.sendmail(settings["from_email"], [to_address], msg.as_string())
+            server.sendmail(settings["from_email"], recipients, msg.as_string())
     except (smtplib.SMTPException, OSError) as e:
         raise EmailError(f"SMTP send failed: {e}")

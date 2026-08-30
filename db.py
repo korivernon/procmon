@@ -56,6 +56,10 @@ def init_db():
             "ALTER TABLE procmon.processes "
             "ADD COLUMN IF NOT EXISTS awaiting_restart_confirmation BOOLEAN DEFAULT FALSE"
         ))
+        conn.execute(text(
+            "ALTER TABLE procmon.processes "
+            "ADD COLUMN IF NOT EXISTS db_tables JSONB DEFAULT '[]'::jsonb"
+        ))
         conn.commit()
 
 

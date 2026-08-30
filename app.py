@@ -97,13 +97,15 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from sqlalchemy import func, text
 
 from procmon import emailer
 from procmon import photon_client
 from procmon import process_manager as pm
+from procmon import usage_tracker
 from procmon.auth import check_password, login_required
 from procmon.db import get_session, init_db
-from procmon.models import Process, ProcessEvent, Project
+from procmon.models import Process, ProcessEvent, Project, UsageSample
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY")
@@ -125,8 +127,16 @@ scheduler = BackgroundScheduler()
 
 
 def _process_page_link(project_id: str) -> str:
-    with app.app_context():
-        return PROCMON_BASE_URL + url_for("project_detail", project_id=project_id)
+    # Built by hand, NOT via url_for -- confirmed a real, severe failure:
+    # url_for outside an active request raises RuntimeError unless
+    # SERVER_NAME is configured (app_context alone is not enough on this
+    # Flask version), and this is called from the reconcile thread's
+    # _notify_crash BEFORE its per-channel try/excepts -- so the raise
+    # escaped into the tick's own catch-all, rolling back the crash event
+    # and skipping the restart. Net effect: any crash that warranted a
+    # notification was silently un-detected, forever. A hardcoded path
+    # matching project_detail's route is boring and cannot fail.
+    return f"{PROCMON_BASE_URL}/projects/{project_id}"
 
 
 def _notify_crash(process: Process, project_name: str) -> None:
@@ -213,21 +223,46 @@ def _process_status(p: Process) -> str:
     return pm.compute_process_status(p.run_mode, p.desired_state, p.pid, p.process_start_time, p.last_exit_code)
 
 
+def _usage_24h(session_db, process_ids: list[str]) -> dict:
+    """log/db bytes generated per process over the last 24h, for the
+    at-a-glance line on each process card -- the full leaderboard and
+    per-process history chart live on the dedicated /usage page."""
+    if not process_ids:
+        return {}
+    cutoff = _now() - timedelta(hours=24)
+    rows = (
+        session_db.query(
+            UsageSample.process_id,
+            func.sum(UsageSample.log_bytes_delta),
+            func.sum(UsageSample.db_bytes_delta),
+        )
+        .filter(UsageSample.process_id.in_(process_ids), UsageSample.sampled_at >= cutoff)
+        .group_by(UsageSample.process_id)
+        .all()
+    )
+    return {row[0]: (row[1] or 0, row[2] or 0) for row in rows}
+
+
 def _project_view_data(session_db, project: Project) -> dict:
     process_rows = []
     statuses = []
+    usage = _usage_24h(session_db, [p.id for p in project.processes])
     for p in project.processes:
         status = _process_status(p)
         statuses.append(status)
+        log_bytes_24h, db_bytes_24h = usage.get(p.id, (0, 0))
         process_rows.append({
             "id": p.id, "name": p.name, "command": p.command,
             "working_dir": p.working_dir, "autostart": p.autostart,
             "status": status, "desired_state": p.desired_state,
             "run_mode": p.run_mode, "schedule_cron": p.schedule_cron,
+            "db_tables": ", ".join(p.db_tables or []),
             "last_exit_code": p.last_exit_code,
             "last_started_at": p.last_started_at.isoformat() if p.last_started_at else None,
             "last_stopped_at": p.last_stopped_at.isoformat() if p.last_stopped_at else None,
             "awaiting_restart_confirmation": p.awaiting_restart_confirmation,
+            "log_bytes_24h": _format_bytes(log_bytes_24h),
+            "db_bytes_24h": _format_bytes(db_bytes_24h) if p.db_tables else None,
         })
     return {
         "id": project.id, "name": project.name,
@@ -307,6 +342,7 @@ def create_process(project_id):
     run_mode = request.form.get("run_mode", "perpetual")
     schedule_cron = request.form.get("schedule_cron", "").strip() or None
     autostart = request.form.get("autostart") == "on"
+    db_tables = _parse_db_tables(request.form.get("db_tables", ""))
 
     if not name or not command:
         return "Both name and command are required", 400
@@ -335,7 +371,7 @@ def create_process(project_id):
         process = Process(
             project_id=project_id, name=name, command=command, working_dir=working_dir,
             autostart=autostart, desired_state="stopped",
-            run_mode=run_mode, schedule_cron=schedule_cron,
+            run_mode=run_mode, schedule_cron=schedule_cron, db_tables=db_tables,
         )
         db.add(process)
         db.flush()
@@ -371,6 +407,7 @@ def edit_process_route(process_id):
     working_dir = request.form.get("working_dir", "").strip() or None
     autostart = request.form.get("autostart") == "on"
     schedule_cron = request.form.get("schedule_cron", "").strip() or None
+    db_tables = _parse_db_tables(request.form.get("db_tables", ""))
 
     if not name or not command:
         return "Both name and command are required", 400
@@ -400,6 +437,10 @@ def edit_process_route(process_id):
         process.name = name
         process.command = command
         process.working_dir = working_dir
+        process.db_tables = db_tables
+        process.auto_restart_abandoned = False  # an edit is exactly the "fixed and started manually"
+                                                    # human intervention abandonment waits for -- the
+                                                    # corrected command deserves a fresh crash budget
         if process.run_mode == "perpetual":
             process.autostart = autostart
         else:
@@ -439,6 +480,8 @@ def start_process_route(process_id):
         process.desired_state = "running"
         process.last_started_at = _now()
         process.awaiting_restart_confirmation = False
+        process.auto_restart_abandoned = False  # a manual start IS the human intervention the
+                                                    # durable crash-loop abandonment waits for
         db.add(ProcessEvent(process_id=process.id, event_type="started", detail=f"pid={pid}"))
         project_id = process.project_id
     return redirect(url_for("project_detail", project_id=project_id))
@@ -570,8 +613,123 @@ def process_logs(process_id):
     return jsonify({"log": pm.tail_log(log_path, lines=lines) if log_path else "(no log path set)"})
 
 
+# ---------------------------------------------------------------------------
+# Usage / data-attribution tracker
+# ---------------------------------------------------------------------------
+
+_USAGE_WINDOWS = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
+
+
+@app.route("/usage")
+@login_required
+def usage_dashboard():
+    return render_template("usage.html")
+
+
+@app.route("/api/usage-summary")
+@login_required
+def api_usage_summary():
+    """
+    Per-process totals across three fixed windows in one query -- a
+    conditional SUM per window rather than three separate queries, since
+    all three read the exact same rows (just narrower cutoffs nested
+    inside each other) and Postgres only has to scan the table once this
+    way. Sorted by 24h total desc -- "what's been intensive lately" is
+    the default question this page answers; the 7d/30d columns are there
+    for context (a one-off spike vs. a sustained pattern), not the
+    primary sort.
+    """
+    now = _now()
+    cutoffs = {window: now - delta for window, delta in _USAGE_WINDOWS.items()}
+    with get_session() as db:
+        rows = db.execute(text("""
+            SELECT
+                s.process_id,
+                p.name AS process_name,
+                proj.name AS project_name,
+                p.db_tables,
+                SUM(CASE WHEN s.sampled_at >= :c24h THEN s.log_bytes_delta ELSE 0 END) AS log_24h,
+                SUM(CASE WHEN s.sampled_at >= :c24h THEN s.db_bytes_delta ELSE 0 END) AS db_24h,
+                SUM(CASE WHEN s.sampled_at >= :c7d THEN s.log_bytes_delta ELSE 0 END) AS log_7d,
+                SUM(CASE WHEN s.sampled_at >= :c7d THEN s.db_bytes_delta ELSE 0 END) AS db_7d,
+                SUM(CASE WHEN s.sampled_at >= :c30d THEN s.log_bytes_delta ELSE 0 END) AS log_30d,
+                SUM(CASE WHEN s.sampled_at >= :c30d THEN s.db_bytes_delta ELSE 0 END) AS db_30d
+            FROM procmon.usage_samples s
+            JOIN procmon.processes p ON p.id = s.process_id
+            JOIN procmon.projects proj ON proj.id = p.project_id
+            WHERE s.sampled_at >= :c30d
+            GROUP BY s.process_id, p.name, proj.name, p.db_tables
+            ORDER BY SUM(CASE WHEN s.sampled_at >= :c24h THEN s.log_bytes_delta + s.db_bytes_delta ELSE 0 END) DESC
+        """), {"c24h": cutoffs["24h"], "c7d": cutoffs["7d"], "c30d": cutoffs["30d"]}).mappings().all()
+
+    results = []
+    for row in rows:
+        tagged = bool(row["db_tables"])
+        results.append({
+            "process_id": row["process_id"], "process_name": row["process_name"],
+            "project_name": row["project_name"], "db_tagged": tagged,
+            "windows": {
+                "24h": {"log_bytes": int(row["log_24h"]), "db_bytes": int(row["db_24h"]) if tagged else None},
+                "7d": {"log_bytes": int(row["log_7d"]), "db_bytes": int(row["db_7d"]) if tagged else None},
+                "30d": {"log_bytes": int(row["log_30d"]), "db_bytes": int(row["db_30d"]) if tagged else None},
+            },
+        })
+    return jsonify(results)
+
+
+@app.route("/processes/<process_id>/usage-series")
+@login_required
+def api_process_usage_series(process_id):
+    """Raw (5-minute-resolution) samples for one process's history chart
+    on the /usage page -- 'hours' controls how far back, default 7 days."""
+    hours = int(request.args.get("hours", 24 * 7))
+    cutoff = _now() - timedelta(hours=hours)
+    with get_session() as db:
+        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        if process is None:
+            return jsonify({"error": "no such process"}), 404
+        samples = (
+            db.query(UsageSample)
+            .filter(UsageSample.process_id == process_id, UsageSample.sampled_at >= cutoff)
+            .order_by(UsageSample.sampled_at.asc())
+            .all()
+        )
+        return jsonify({
+            "process_name": process.name,
+            "db_tagged": bool(process.db_tables),
+            "samples": [{
+                "sampled_at": s.sampled_at.isoformat(),
+                "log_bytes_delta": s.log_bytes_delta,
+                "db_bytes_delta": s.db_bytes_delta,
+            } for s in samples],
+        })
+
+
 def _now():
     return datetime.utcnow()
+
+
+def _parse_db_tables(raw: str) -> list[str]:
+    """Comma-separated "schema.table" list from a plain text form field
+    into the list usage_tracker.py expects -- trims whitespace and drops
+    empty entries (e.g. from a trailing comma), doesn't otherwise
+    validate the table names here: an invalid/nonexistent one is caught
+    per-table, harmlessly, at sample time (see usage_tracker._db_tables_size)."""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _format_bytes(n) -> str:
+    if n is None:
+        return "—"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if unit == "B":
+            if n < 1024:
+                return f"{int(n)}B"
+        elif n < 1024 or unit == "TB":
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +808,26 @@ def _autostart_processes():
         for process in to_start:
             if _process_status(process) == "green":
                 continue
+            # ADOPT before spawning: kill_duplicate_processes below only
+            # matches procmon's own marker-wrapped instances -- a live
+            # instance started OUTSIDE procmon (plain argv) survives it, and
+            # blindly starting a fresh copy alongside it is exactly what
+            # ignited the 8/25 storm: an untracked emon server held port
+            # 8444, autostart spawned a duplicate into the conflict, and the
+            # replacement died on bind every 25 seconds for ten hours.
+            match = pm.find_running_instance(process.command, exclude_pid=process.pid)
+            if match is not None:
+                found_pid, found_create_time = match
+                process.pid = found_pid
+                process.process_start_time = found_create_time
+                process.desired_state = "running"
+                process.awaiting_restart_confirmation = False
+                process.auto_restart_abandoned = False
+                if process.last_started_at is None:
+                    process.last_started_at = _now()
+                db.add(ProcessEvent(process_id=process.id, event_type="started",
+                                     detail=f"autostart: adopted already-live instance, pid={found_pid}"))
+                continue
             # procmon itself restarting forgets its in-memory state, but doesn't touch
             # already-running child processes (they're their own session group) -- so an
             # old instance from the PREVIOUS procmon run can still be alive here even
@@ -687,14 +865,42 @@ def _recent_crash_count(db, process_id: str) -> int:
     )
 
 
-def _recently_abandoned(db, process_id: str) -> bool:
-    cutoff = _now() - timedelta(minutes=CRASH_LOOP_WINDOW_MINUTES)
-    return (
-        db.query(ProcessEvent)
-        .filter(ProcessEvent.process_id == process_id, ProcessEvent.event_type == "restart_abandoned",
-                 ProcessEvent.created_at >= cutoff)
-        .count() > 0
-    )
+def _adopt_unreconciled_processes(db) -> None:
+    """
+    For every PERPETUAL process procmon doesn't currently believe is
+    running (whether desired_state is "running" with a dead/stale pid,
+    or "stopped" entirely), checks whether it's actually alive anyway
+    -- started manually outside procmon, or left running from before
+    procmon itself last restarted (a process's own OS session survives
+    that; only procmon's in-memory/DB-row tracking of it doesn't). If
+    so, ADOPTS it: records its real pid/create_time and marks it
+    running, rather than either showing it incorrectly red or, worse,
+    spawning a genuine duplicate the next time someone hits Start.
+
+    Deliberately runs BEFORE the crash-detection pass below, in the
+    same reconcile tick -- a process this adopts is, by definition, not
+    actually crashed, so it must never reach that pass and get logged
+    as one.
+    """
+    for process in db.query(Process).filter_by(run_mode="perpetual").all():
+        if pm.is_actually_running(process.pid, process.process_start_time):
+            continue
+        match = pm.find_running_instance(process.command, exclude_pid=process.pid)
+        if match is None:
+            continue
+        found_pid, found_create_time = match
+        process.pid = found_pid
+        process.process_start_time = found_create_time
+        process.desired_state = "running"
+        process.awaiting_restart_confirmation = False
+        process.auto_restart_abandoned = False  # it's verifiably alive -- a prior crash-loop
+                                                    # abandonment no longer describes reality
+        if process.last_started_at is None:
+            process.last_started_at = _now()
+        db.add(ProcessEvent(
+            process_id=process.id, event_type="started",
+            detail=f"adopted -- found already running outside procmon's own tracking, pid={found_pid}",
+        ))
 
 
 def _reconcile_loop():
@@ -704,6 +910,9 @@ def _reconcile_loop():
     if not, that's a real, unexpected crash. Logs it, and then actually
     attempts to restart it (the real fix for "perpetually stay up" --
     previously this only logged the crash and stopped there).
+
+    Before any of that, _adopt_unreconciled_processes() gets first look
+    at every perpetual process each tick -- see its own docstring.
 
     CRASH-LOOP BACKOFF, a deliberate, real safety mechanism: if a
     process has crashed CRASH_LOOP_THRESHOLD times within the last
@@ -722,31 +931,53 @@ def _reconcile_loop():
     while True:
         try:
             with get_session() as db:
+                _adopt_unreconciled_processes(db)
+
+                # Capped log rotation for every process's captured output --
+                # a real 1.3 GB unrotated log helped push the disk to 98%,
+                # which would eventually take down Postgres and every
+                # monitored app at once. Cheap size check per tick.
+                for process in db.query(Process).all():
+                    if process.log_path:
+                        pm.rotate_log_if_needed(process.log_path)
+
                 running_desired = db.query(Process).filter_by(desired_state="running", run_mode="perpetual").all()
                 for process in running_desired:
                     if pm.is_actually_running(process.pid, process.process_start_time):
                         continue
 
-                    db.add(ProcessEvent(
-                        process_id=process.id, event_type="crashed",
-                        detail=f"detected during routine health check -- pid {process.pid} no longer running",
-                    ))
+                    # DURABLE abandonment: once the crash-loop backstop has
+                    # tripped, this process gets no more "crashed" events and
+                    # no more restart attempts until a human intervenes
+                    # (manual start / edit) or it's adopted verifiably alive.
+                    # The old event-window check silently expired after 5
+                    # minutes, so the 8/25 port-conflict storm retried all
+                    # night and logged 1,400+ "crashed" rows for what was one
+                    # ongoing condition. Status stays red the whole time --
+                    # abandoned is still a problem, just not a spammable one.
+                    if process.auto_restart_abandoned:
+                        continue
 
                     if not process.awaiting_restart_confirmation:
-                        # only the FIRST crash of a given crash-cycle sends a text -- this loop
-                        # re-detects "not running" every RECONCILE_INTERVAL_SECONDS until either a
-                        # restart succeeds or the crash-loop backoff kicks in below, and neither of
-                        # those should mean re-texting every 15 seconds forever
+                        # Both the event row and the text fire once per real
+                        # crash-cycle: a successful restart clears the flag, so
+                        # a genuine crash->restart->crash sequence still logs
+                        # each real death, while "still dead 15s later" no
+                        # longer re-logs the same death every tick forever.
+                        db.add(ProcessEvent(
+                            process_id=process.id, event_type="crashed",
+                            detail=f"detected during routine health check -- pid {process.pid} no longer running",
+                        ))
                         process.awaiting_restart_confirmation = True
                         _notify_crash(process, process.project.name)
 
                     if _recent_crash_count(db, process.id) >= CRASH_LOOP_THRESHOLD:
-                        if not _recently_abandoned(db, process.id):
-                            db.add(ProcessEvent(
-                                process_id=process.id, event_type="restart_abandoned",
-                                detail=f"{CRASH_LOOP_THRESHOLD}+ crashes within {CRASH_LOOP_WINDOW_MINUTES} minutes -- "
-                                       f"not auto-restarting further until this is fixed and started manually.",
-                            ))
+                        process.auto_restart_abandoned = True
+                        db.add(ProcessEvent(
+                            process_id=process.id, event_type="restart_abandoned",
+                            detail=f"{CRASH_LOOP_THRESHOLD}+ crashes within {CRASH_LOOP_WINDOW_MINUTES} minutes -- "
+                                   f"not auto-restarting further until this is fixed and started manually.",
+                        ))
                         continue  # desired_state stays "running" -- correctly stays red, not silently "fine"
 
                     killed = pm.kill_duplicate_processes(process.id, exclude_pid=process.pid)
@@ -761,9 +992,31 @@ def _reconcile_loop():
                         process.awaiting_restart_confirmation = False
                         db.add(ProcessEvent(process_id=process.id, event_type="started", detail=f"auto-restart after crash, pid={pid}"))
                     except Exception as e:
-                        db.add(ProcessEvent(process_id=process.id, event_type="restart_failed", detail=f"auto-restart failed: {e}"))
+                        # The restart may have failed BECAUSE a live instance
+                        # already holds the process's resources (the 8/25
+                        # storm: an untracked orphan owned port 8444, so every
+                        # replacement died on bind for ten hours). Before
+                        # recording a plain failure, check for a live instance
+                        # of this exact command and ADOPT it instead of
+                        # fighting it.
+                        match = pm.find_running_instance(process.command, exclude_pid=process.pid)
+                        if match is not None:
+                            found_pid, found_create_time = match
+                            process.pid = found_pid
+                            process.process_start_time = found_create_time
+                            process.awaiting_restart_confirmation = False
+                            db.add(ProcessEvent(
+                                process_id=process.id, event_type="started",
+                                detail=f"restart failed ({e}) but a live instance of this command was found and adopted instead, pid={found_pid}",
+                            ))
+                        else:
+                            db.add(ProcessEvent(process_id=process.id, event_type="restart_failed", detail=f"auto-restart failed: {e}"))
         except Exception:
-            pass  # a failure in the reconciliation loop itself should never crash the whole app
+            # never crash the app over a reconcile failure -- but never hide
+            # it either: a silently-swallowed recurring exception here means
+            # NO crash detection at all (a real, observed outage of this
+            # loop went unnoticed for hours behind a bare `pass`).
+            logger.exception("reconcile tick failed")
         time.sleep(RECONCILE_INTERVAL_SECONDS)
 
 
@@ -773,6 +1026,7 @@ def create_app():
     _register_all_scheduled_jobs()
     scheduler.start()
     threading.Thread(target=_reconcile_loop, daemon=True).start()
+    threading.Thread(target=usage_tracker.sample_loop, daemon=True).start()
     return app
 
 
