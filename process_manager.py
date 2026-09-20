@@ -536,6 +536,44 @@ def compute_project_status(process_statuses: list[str]) -> str:
     return "amber"
 
 
+def clear_log(log_path: Optional[str]) -> int:
+    """
+    Manually reclaims disk space by truncating a process's captured log to
+    zero -- the deliberate, on-demand counterpart to rotate_log_if_needed's
+    automatic cap. Same truncate-in-place safety reasoning applies (see that
+    function's own docstring): the monitored child, if still running, holds
+    an O_APPEND fd to this exact file, so truncating it live is safe -- the
+    next write atomically seeks to the new (zero) end of file, no rename,
+    no restart needed, nothing lost mid-write.
+
+    Also removes the ".1" rotated-tail file alongside it, if one exists --
+    a user asking to "clear logs to reclaim space" means all of it, not
+    just the live file while an old rotated copy quietly keeps the space
+    it was already holding.
+
+    Returns the number of bytes actually freed (0 if there was nothing to
+    clear, e.g. no log file yet).
+    """
+    freed = 0
+    if log_path and os.path.exists(log_path):
+        try:
+            freed += os.path.getsize(log_path)
+            with open(log_path, "r+b") as f:
+                f.truncate(0)
+        except OSError as e:
+            logger.warning("clear_log failed for %s: %s", log_path, e)
+
+    rotated_path = f"{log_path}.1" if log_path else None
+    if rotated_path and os.path.exists(rotated_path):
+        try:
+            freed += os.path.getsize(rotated_path)
+            os.remove(rotated_path)
+        except OSError as e:
+            logger.warning("clear_log failed removing %s: %s", rotated_path, e)
+
+    return freed
+
+
 def rotate_log_if_needed(log_path: str, max_bytes: int = 50 * 1024 * 1024,
                           keep_bytes: int = 5 * 1024 * 1024) -> bool:
     """

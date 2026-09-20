@@ -20,6 +20,21 @@
 
 <link rel="icon" type="image/png" sizes="192x192" href="/static/icon-192.png">
 
+<!-- Rich link previews (iMessage, Slack, etc.) -- these render on EVERY page,
+     including login.html, deliberately: any unauthenticated fetch (e.g. a
+     link-preview crawler with no session cookie) gets redirected to /login
+     by @login_required, so that's the page whose meta tags actually end up
+     getting read for a link shared while logged out. Static and generic on
+     purpose -- crash notifications already put the real specifics (which
+     process, which project) directly in the message text itself; this tag
+     set exists only to turn a bare "Tap to Load Preview" into a branded
+     card, not to expose live process data to an unauthenticated fetcher. -->
+<meta property="og:title" content="procmon">
+<meta property="og:description" content="Process monitor">
+<meta property="og:type" content="website">
+<meta property="og:image" content="{{ request.url_root }}static/icon-512.png">
+<meta name="twitter:card" content="summary">
+
 <style>
   :root {
     --bg: #0f1115; --card: #171a21; --border: #2a2f3a; --text: #e6e8eb; --muted: #8b94a3;

@@ -11,11 +11,19 @@
   process tagged with its own tables (edit a process to add tags). Sorted by the last 24 hours.
 </div>
 
-<div class="actions" style="margin-bottom:14px;">
-  <button type="button" class="window-btn" data-window="24h">24h</button>
-  <button type="button" class="window-btn" data-window="7d">7d</button>
-  <button type="button" class="window-btn" data-window="30d">30d</button>
+<div class="actions" style="margin-bottom:10px; justify-content:space-between;">
+  <div class="actions">
+    <button type="button" class="window-btn" data-window="24h">24h</button>
+    <button type="button" class="window-btn" data-window="7d">7d</button>
+    <button type="button" class="window-btn" data-window="30d">30d</button>
+  </div>
+  <div class="actions">
+    <button type="button" class="group-btn" data-group="process">By process</button>
+    <button type="button" class="group-btn" data-group="project">By project</button>
+  </div>
 </div>
+
+<div id="total" class="card" style="margin-bottom:14px;"><div class="muted">Loading&hellip;</div></div>
 
 <div id="rows"><div class="muted">Loading&hellip;</div></div>
 
@@ -28,16 +36,23 @@
   .usage-bytes .muted { font-size: 0.75em; }
   .window-btn { }
   .window-btn.active { background: #2f6fed; border-color: #2f6fed; }
+  .group-btn { }
+  .group-btn.active { background: #2f6fed; border-color: #2f6fed; }
+  .project-processes { margin-top:8px; padding-top:8px; border-top:1px solid var(--border); display:none; }
+  .project-process-row { display:flex; justify-content:space-between; gap:10px; padding:4px 0; font-size:0.9em; }
   .chart-wrap { margin-top: 10px; display:none; }
   .chart-legend { display:flex; gap:14px; margin-top:6px; font-size:0.8em; }
   .legend-swatch { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .clear-log-btn { flex-shrink:0; font-size:0.85em; padding:6px 10px; }
 </style>
 
 <script>
 const WINDOWS = ["24h", "7d", "30d"];
 let currentWindow = "24h";
+let currentGroup = "process";
 let summaryCache = null;
 const openCharts = new Set();
+const openProjects = new Set();
 
 function formatBytes(n) {
   if (n === null || n === undefined) return "—";
@@ -50,13 +65,73 @@ function formatBytes(n) {
 function setWindow(w) {
   currentWindow = w;
   document.querySelectorAll(".window-btn").forEach(b => b.classList.toggle("active", b.dataset.window === w));
-  renderRows();
+  render();
+}
+
+function setGroup(g) {
+  currentGroup = g;
+  document.querySelectorAll(".group-btn").forEach(b => b.classList.toggle("active", b.dataset.group === g));
+  render();
+}
+
+function render() {
+  renderTotal();
+  if (currentGroup === "project") renderProjectRows();
+  else renderRows();
+}
+
+// Grand total across EVERY process, regardless of the current grouping view --
+// db_bytes only counts db-tagged processes (untagged ones have no db signal at
+// all, not a zero, matching the per-row/per-project convention elsewhere).
+function renderTotal() {
+  const el = document.getElementById("total");
+  if (!summaryCache) return;
+  if (summaryCache.length === 0) { el.innerHTML = ""; return; }
+  let logTotal = 0, dbTotal = 0, anyTagged = false;
+  for (const row of summaryCache) {
+    logTotal += row.windows[currentWindow].log_bytes;
+    if (row.db_tagged) { anyTagged = true; dbTotal += row.windows[currentWindow].db_bytes || 0; }
+  }
+  el.innerHTML = `
+    <div class="usage-cols">
+      <div class="usage-name">Total across all projects</div>
+      <div class="usage-bytes">
+        <div>${formatBytes(logTotal)} logs${anyTagged ? ' &middot; ' + formatBytes(dbTotal) + ' db' : ''}</div>
+        <div class="muted">${anyTagged ? '' : 'no db-tagged processes'}</div>
+      </div>
+    </div>
+  `;
+}
+
+// One row per project -- sums every one of its processes' bytes for the
+// current window. db_bytes stays null unless AT LEAST ONE process in the
+// project is tagged (matches the per-process "db not tagged" convention:
+// an untagged project isn't "0 db bytes", it's "unmeasured").
+function aggregateByProject(rows) {
+  const byProject = new Map();
+  for (const row of rows) {
+    if (!byProject.has(row.project_name)) {
+      byProject.set(row.project_name, {
+        project_name: row.project_name, processes: [],
+        windows: Object.fromEntries(WINDOWS.map(w => [w, { log_bytes: 0, db_bytes: null }])),
+      });
+    }
+    const proj = byProject.get(row.project_name);
+    proj.processes.push(row);
+    for (const w of WINDOWS) {
+      proj.windows[w].log_bytes += row.windows[w].log_bytes;
+      if (row.db_tagged) {
+        proj.windows[w].db_bytes = (proj.windows[w].db_bytes || 0) + (row.windows[w].db_bytes || 0);
+      }
+    }
+  }
+  return [...byProject.values()];
 }
 
 async function loadSummary() {
   const res = await fetch("{{ url_for('api_usage_summary') }}");
   summaryCache = await res.json();
-  renderRows();
+  render();
 }
 
 function renderRows() {
@@ -86,11 +161,117 @@ function renderRows() {
           <div>${formatBytes(w.log_bytes)} logs${row.db_tagged ? ' &middot; ' + formatBytes(w.db_bytes) + ' db' : ''}</div>
           <div class="muted">${row.db_tagged ? '' : 'db not tagged'}</div>
         </div>
+        <button type="button" class="clear-log-btn danger" data-process-id="${row.process_id}" data-process-name="${row.process_name}">Clear log</button>
       </div>
       <div class="chart-wrap" id="chart-${row.process_id}"></div>
     `;
+    el.querySelector(".clear-log-btn").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      clearLog(row.process_id, row.process_name, ev.target);
+    });
     el.addEventListener("click", () => toggleChart(row.process_id, row.process_name));
     container.appendChild(el);
+  }
+}
+
+function renderProjectRows() {
+  const container = document.getElementById("rows");
+  if (!summaryCache) return;
+  if (summaryCache.length === 0) {
+    container.innerHTML = '<div class="muted">No usage samples yet -- the tracker samples every 5 minutes, check back shortly.</div>';
+    return;
+  }
+  const projects = aggregateByProject(summaryCache).sort((a, b) => {
+    const ta = a.windows[currentWindow].log_bytes + (a.windows[currentWindow].db_bytes || 0);
+    const tb = b.windows[currentWindow].log_bytes + (b.windows[currentWindow].db_bytes || 0);
+    return tb - ta;
+  });
+  container.innerHTML = "";
+  for (const proj of projects) {
+    const w = proj.windows[currentWindow];
+    const anyTagged = w.db_bytes !== null;
+    const el = document.createElement("div");
+    el.className = "card usage-row";
+    el.innerHTML = `
+      <div class="usage-cols">
+        <div>
+          <div class="usage-name">${proj.project_name}</div>
+          <div class="muted">${proj.processes.length} process${proj.processes.length === 1 ? '' : 'es'}</div>
+        </div>
+        <div class="usage-bytes">
+          <div>${formatBytes(w.log_bytes)} logs${anyTagged ? ' &middot; ' + formatBytes(w.db_bytes) + ' db' : ''}</div>
+          <div class="muted">${anyTagged ? '' : 'no db-tagged processes'}</div>
+        </div>
+        <button type="button" class="clear-log-btn danger">Clear all logs</button>
+      </div>
+      <div class="project-processes" id="proj-processes-${proj.project_name}"></div>
+    `;
+    el.querySelector(".clear-log-btn").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      clearAllLogsInProject(proj, ev.target);
+    });
+    el.addEventListener("click", (ev) => {
+      if (ev.target.closest(".project-processes") || ev.target.closest(".clear-log-btn")) return; // don't collapse on those clicks
+      toggleProjectBreakdown(proj);
+    });
+    container.appendChild(el);
+  }
+}
+
+function toggleProjectBreakdown(proj) {
+  const wrap = document.getElementById(`proj-processes-${proj.project_name}`);
+  if (!wrap) return;
+  if (openProjects.has(proj.project_name)) {
+    wrap.style.display = "none";
+    openProjects.delete(proj.project_name);
+    return;
+  }
+  openProjects.add(proj.project_name);
+  wrap.style.display = "block";
+  const sortedProcs = [...proj.processes].sort((a, b) => {
+    const ta = a.windows[currentWindow].log_bytes + (a.windows[currentWindow].db_bytes || 0);
+    const tb = b.windows[currentWindow].log_bytes + (b.windows[currentWindow].db_bytes || 0);
+    return tb - ta;
+  });
+  wrap.innerHTML = sortedProcs.map(p => {
+    const w = p.windows[currentWindow];
+    return `<div class="project-process-row">
+      <span>${p.process_name}</span>
+      <span class="usage-bytes">${formatBytes(w.log_bytes)} logs${p.db_tagged ? ' &middot; ' + formatBytes(w.db_bytes) + ' db' : ''}</span>
+    </div>`;
+  }).join("");
+}
+
+async function clearLog(processId, processName, buttonEl) {
+  if (!confirm(`Clear ${processName}'s log? This permanently deletes its captured output (and any rotated backup) -- can't be undone.`)) return;
+  const originalText = buttonEl.textContent;
+  buttonEl.disabled = true;
+  buttonEl.textContent = "Clearing…";
+  try {
+    const res = await fetch(`/processes/${processId}/clear-log`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "clear failed");
+    await loadSummary(); // re-fetch so the freed space shows up immediately, not just next sample
+  } catch (e) {
+    alert(`Could not clear log: ${e.message}`);
+    buttonEl.disabled = false;
+    buttonEl.textContent = originalText;
+  }
+}
+
+async function clearAllLogsInProject(proj, buttonEl) {
+  if (!confirm(`Clear logs for all ${proj.processes.length} process(es) in ${proj.project_name}? This permanently deletes their captured output -- can't be undone.`)) return;
+  const originalText = buttonEl.textContent;
+  buttonEl.disabled = true;
+  buttonEl.textContent = "Clearing…";
+  try {
+    await Promise.all(proj.processes.map(p => fetch(`/processes/${p.process_id}/clear-log`, { method: "POST" })));
+    await loadSummary();
+  } catch (e) {
+    alert(`Could not clear logs: ${e.message}`);
+  } finally {
+    buttonEl.disabled = false;
+    buttonEl.textContent = originalText;
   }
 }
 
@@ -148,7 +329,9 @@ function renderChart(samples, dbTagged) {
 }
 
 document.querySelectorAll(".window-btn").forEach(b => b.addEventListener("click", () => setWindow(b.dataset.window)));
-setWindow("24h");
+document.querySelectorAll(".group-btn").forEach(b => b.addEventListener("click", () => setGroup(b.dataset.group)));
+document.querySelector('.window-btn[data-window="24h"]').classList.add("active");
+document.querySelector('.group-btn[data-group="process"]').classList.add("active");
 loadSummary();
 setInterval(loadSummary, 30000);
 </script>

@@ -92,7 +92,8 @@ except ImportError:
             # pattern used throughout this session's other scripts
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -180,6 +181,79 @@ def _notify_crash(process: Process, project_name: str) -> None:
             )
         except Exception as e:
             logger.error("Failed to send crash email for %s: %s", process.name, e)
+
+
+CRASH_NOTIFY_GRACE_SECONDS = 20  # see _delayed_crash_check() -- avoids alarming "crashed"
+                                    # texts for what's actually a quick, deliberate outside
+                                    # restart (e.g. someone manually restarting pomtrader),
+                                    # which typically comes back well within this window
+
+
+EASTERN = ZoneInfo("America/New_York")
+
+
+def _format_eastern(dt: datetime | None) -> str:
+    """dt is naive UTC (everything in this file comes from _now() ==
+    datetime.utcnow()) -- stamp it UTC, then convert to US/Eastern. Uses
+    America/New_York rather than a fixed UTC-5 offset specifically so this
+    stays correct across the EST/EDT transition instead of silently
+    drifting an hour off for half the year; %Z prints whichever of the two
+    actually applies on that date."""
+    if dt is None:
+        return "unknown time"
+    eastern = dt.replace(tzinfo=timezone.utc).astimezone(EASTERN)
+    return eastern.strftime("%-I:%M %p %Z on %b %-d")
+
+
+def _notify_recovered(process_name: str, project_name: str, restarted_at: datetime | None) -> None:
+    """
+    The calm counterpart to _notify_crash() -- fired by _delayed_crash_check()
+    when a process that was briefly detected down is confirmed back up by the
+    end of the grace period. Deliberately no red circle / "crashed" wording,
+    and no link: from the recipient's side this usually WAS just a deliberate
+    restart (outside procmon), not an incident worth clicking through to.
+    """
+    text = f"✅ {process_name} ({project_name}) restarted at {_format_eastern(restarted_at)}."
+    if PROCMON_NOTIFY_PHONE and photon_client.PHOTON_SHARED_SECRET:
+        try:
+            photon_client.send_imessage(PROCMON_NOTIFY_PHONE, text)
+        except Exception as e:
+            logger.error("Failed to send restarted text for %s: %s", process_name, e)
+    if emailer.PROCMON_NOTIFY_EMAIL:
+        try:
+            emailer.send_email(emailer.PROCMON_NOTIFY_EMAIL, f"[procmon] {process_name} ({project_name}) restarted", text)
+        except Exception as e:
+            logger.error("Failed to send restarted email for %s: %s", process_name, e)
+
+
+def _delayed_crash_check(process_id: str, project_name: str) -> None:
+    """
+    Runs once, CRASH_NOTIFY_GRACE_SECONDS after a process was first detected
+    down -- on its own background thread (via threading.Timer), so it never
+    blocks the reconcile loop's own 15s tick for every OTHER process while it
+    waits out the grace window.
+
+    Re-reads the process fresh from the DB rather than trusting anything
+    captured at scheduling time -- by now the reconcile loop's own
+    auto-restart (or crash-loop abandonment), or someone finishing an
+    outside restart, may well have already changed its pid. Whichever
+    outcome is true NOW is what actually gets reported:
+      - back up  -> _notify_recovered() (calm, no "crashed" wording)
+      - still down -> _notify_crash() (the original, urgent text) -- a
+        genuine ongoing outage still gets the real alert, this grace
+        period only suppresses the false alarm for a quick restart.
+    """
+    try:
+        with get_session() as db:
+            process = db.query(Process).filter_by(id=process_id).one_or_none()
+            if process is None:
+                return  # deleted since the crash was first detected
+            if pm.is_actually_running(process.pid, process.process_start_time):
+                _notify_recovered(process.name, project_name, process.last_started_at)
+            else:
+                _notify_crash(process, project_name)
+    except Exception:
+        logger.exception("delayed crash check failed for process_id=%s", process_id)
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +779,28 @@ def api_process_usage_series(process_id):
         })
 
 
+@app.route("/processes/<process_id>/clear-log", methods=["POST"])
+@login_required
+def clear_process_log(process_id):
+    """
+    Manually reclaims disk space from the /usage page -- truncates the
+    process's captured log (and any rotated ".1" tail) to zero. Safe
+    whether the process is currently running or not (see
+    process_manager.clear_log's own docstring); does NOT touch
+    usage_samples history, only the live log file, so past usage charts
+    still show what was actually generated before the clear. Not logged
+    as a ProcessEvent -- that log is start/stop/crash lifecycle history,
+    not a fit for "someone reclaimed disk space."
+    """
+    with get_session() as db:
+        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        if process is None:
+            return jsonify({"error": "no such process"}), 404
+        log_path = process.log_path
+    freed = pm.clear_log(log_path)
+    return jsonify({"freed_bytes": freed})
+
+
 def _now():
     return datetime.utcnow()
 
@@ -959,17 +1055,28 @@ def _reconcile_loop():
                         continue
 
                     if not process.awaiting_restart_confirmation:
-                        # Both the event row and the text fire once per real
-                        # crash-cycle: a successful restart clears the flag, so
-                        # a genuine crash->restart->crash sequence still logs
+                        # Both the event row and the notification fire once per
+                        # real crash-cycle: a successful restart clears the flag,
+                        # so a genuine crash->restart->crash sequence still logs
                         # each real death, while "still dead 15s later" no
                         # longer re-logs the same death every tick forever.
+                        #
+                        # The notification itself is DEFERRED by
+                        # CRASH_NOTIFY_GRACE_SECONDS (see _delayed_crash_check) --
+                        # fired on its own background thread so it doesn't block
+                        # this tick's handling of every other process. Not
+                        # deferred: the ProcessEvent row (still logged immediately,
+                        # right here) and the auto-restart attempt further below --
+                        # only the outbound text/email waits, so someone watching
+                        # the web app itself still sees the crash the moment it's
+                        # detected, same as before.
                         db.add(ProcessEvent(
                             process_id=process.id, event_type="crashed",
                             detail=f"detected during routine health check -- pid {process.pid} no longer running",
                         ))
                         process.awaiting_restart_confirmation = True
-                        _notify_crash(process, process.project.name)
+                        threading.Timer(CRASH_NOTIFY_GRACE_SECONDS, _delayed_crash_check,
+                                         args=[process.id, process.project.name]).start()
 
                     if _recent_crash_count(db, process.id) >= CRASH_LOOP_THRESHOLD:
                         process.auto_restart_abandoned = True
