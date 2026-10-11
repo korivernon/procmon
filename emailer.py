@@ -94,6 +94,15 @@ def _smtp_settings() -> dict:
     }
 
 
+def app_subject(subject, app):
+    """Every email leads with the app it's from -- asked directly: "make sure any emails that are coming from an
+    application have the application name in it at the start of the subject"."""
+    s = str(subject or "").strip()
+    if s.lower().startswith(f"[{app.lower()}]"):          # an older "[app] ..." tag becomes the "app: ..." lead
+        s = s[len(app) + 2:].lstrip()
+    return s if s.lower().startswith(app.lower() + ":") else f"{app}: {s}"
+
+
 def send_email(to_address: str, subject: str, body: str) -> None:
     # to_address may be a single address or a "," / ";" separated list (e.g.
     # PROCMON_NOTIFY_EMAIL="a@x.com,b@y.com") -- split it out so each name
@@ -103,7 +112,7 @@ def send_email(to_address: str, subject: str, body: str) -> None:
 
     settings = _smtp_settings()
     msg = MIMEText(body)
-    msg["Subject"] = subject
+    msg["Subject"] = app_subject(subject, "procmon")
     msg["From"] = settings["from_email"]
     msg["To"] = ", ".join(recipients)
 
