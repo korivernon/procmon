@@ -152,6 +152,24 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
     return proc.pid, str(create_time)
 
 
+def _iter_procs_with_cmdline():
+    """Yields (psutil.Process, cmdline) for every readable process. Walks
+    psutil.pids() instead of psutil.process_iter(["cmdline"]) because the
+    latter computes cmdline inside the iterator itself, where a raw
+    OSError from sysctl(KERN_PROCARGS2) -- which macOS raises for a
+    process caught mid-exec, i.e. constantly during the boot-time launch
+    storm -- escapes every try/except the callers can write, aborting the
+    whole scan (confirmed in procmon's own log: "reconcile tick failed"
+    on exactly this OSError). Here an unreadable process is just skipped."""
+    for pid in psutil.pids():
+        try:
+            proc = psutil.Process(pid)
+            cmdline = proc.cmdline()
+        except (psutil.Error, OSError):
+            continue
+        yield proc, cmdline
+
+
 def kill_duplicate_processes(process_id: str, exclude_pid: Optional[int] = None) -> list[int]:
     """
     Finds and force-kills any OS process previously started (via
@@ -183,12 +201,8 @@ def kill_duplicate_processes(process_id: str, exclude_pid: Optional[int] = None)
     marker = _duplicate_marker(process_id)
     own_pid = os.getpid()
     killed = []
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc, cmdline in _iter_procs_with_cmdline():
         if proc.pid in (exclude_pid, own_pid):
-            continue
-        try:
-            cmdline = proc.info["cmdline"] or []
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
         if len(cmdline) < 3 or cmdline[1] != "-c" or not cmdline[2].startswith(marker):
@@ -287,14 +301,13 @@ def find_running_instance(command: str, exclude_pid: Optional[int] = None) -> Op
                                 # the shell-wrapper form (an exact string compare) still can
 
     own_pid = os.getpid()
-    for proc in psutil.process_iter(["pid", "cmdline"]):
+    for proc, cmdline in _iter_procs_with_cmdline():
         if proc.pid in (exclude_pid, own_pid):
             continue
         try:
-            cmdline = proc.info["cmdline"] or []
             if proc.status() == psutil.STATUS_ZOMBIE:
                 continue
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        except (psutil.Error, OSError):
             continue
 
         is_shell_wrapper = len(cmdline) == 3 and cmdline[1] == "-c" and cmdline[2] == command

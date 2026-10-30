@@ -92,6 +92,7 @@ except ImportError:
             # pattern used throughout this session's other scripts
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -380,7 +381,7 @@ def create_project():
 @login_required
 def project_detail(project_id):
     with get_session() as db:
-        project = db.query(Project).filter_by(id=project_id).one_or_none()
+        project = _get_by_id(db, Project, project_id)
         if project is None:
             return "No such project", 404
         data = _project_view_data(db, project)
@@ -391,7 +392,7 @@ def project_detail(project_id):
 @login_required
 def delete_project(project_id):
     with get_session() as db:
-        project = db.query(Project).filter_by(id=project_id).one_or_none()
+        project = _get_by_id(db, Project, project_id)
         if project is None:
             return "No such project", 404
         for p in project.processes:
@@ -416,7 +417,7 @@ def set_project_link(project_id):
     if url and not url.startswith(("http://", "https://")):
         url = "https://" + url
     with get_session() as db:
-        project = db.query(Project).filter_by(id=project_id).one_or_none()
+        project = _get_by_id(db, Project, project_id)
         if project is None:
             return "No such project", 404
         project.public_url = url or None
@@ -451,7 +452,7 @@ def create_process(project_id):
 
     log_dir = os.environ.get("PROCMON_LOG_DIR", "/tmp/procmon_logs")
     with get_session() as db:
-        project = db.query(Project).filter_by(id=project_id).one_or_none()
+        project = _get_by_id(db, Project, project_id)
         if project is None:
             return "No such project", 404
         existing = db.query(Process).filter_by(project_id=project_id, name=name).one_or_none()
@@ -503,7 +504,7 @@ def edit_process_route(process_id):
         return "Both name and command are required", 400
 
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
 
@@ -545,7 +546,7 @@ def edit_process_route(process_id):
 @login_required
 def start_process_route(process_id):
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
         if process.run_mode == "scheduled":
@@ -596,7 +597,7 @@ def trigger_scheduled_process_route(process_id):
     takes to finish.
     """
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
         if process.run_mode != "scheduled":
@@ -632,7 +633,7 @@ def stop_scheduled_process_route(process_id):
     row.
     """
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
         if process.run_mode != "scheduled":
@@ -649,7 +650,7 @@ def stop_scheduled_process_route(process_id):
 @login_required
 def stop_process_route(process_id):
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
 
@@ -679,7 +680,7 @@ def restart_process_route(process_id):
 @login_required
 def delete_process_route(process_id):
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return "No such process", 404
         if _process_status(process) == "green":
@@ -695,7 +696,7 @@ def delete_process_route(process_id):
 @login_required
 def process_logs(process_id):
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return jsonify({"error": "no such process"}), 404
         log_path = process.log_path
@@ -775,7 +776,7 @@ def api_process_usage_series(process_id):
     hours = int(request.args.get("hours", 24 * 7))
     cutoff = _now() - timedelta(hours=hours)
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return jsonify({"error": "no such process"}), 404
         samples = (
@@ -809,12 +810,28 @@ def clear_process_log(process_id):
     not a fit for "someone reclaimed disk space."
     """
     with get_session() as db:
-        process = db.query(Process).filter_by(id=process_id).one_or_none()
+        process = _get_by_id(db, Process, process_id)
         if process is None:
             return jsonify({"error": "no such process"}), 404
         log_path = process.log_path
     freed = pm.clear_log(log_path)
     return jsonify({"freed_bytes": freed})
+
+
+def _get_by_id(db, model, raw_id: str):
+    """
+    Looks up a Process/Project by an id taken from the URL -- returns None
+    (which every route already turns into a clean 404) for a string that
+    isn't a valid UUID, instead of letting Postgres reject it with an
+    unhandled DataError ("invalid input syntax for type uuid") -> 500.
+    Only for ids that arrive from a request; internal callers pass ids
+    that were read back from the DB, so they can't be malformed.
+    """
+    try:
+        uuid.UUID(raw_id)
+    except ValueError:
+        return None
+    return db.query(model).filter_by(id=raw_id).one_or_none()
 
 
 def _now():
