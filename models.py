@@ -46,6 +46,7 @@ class Project(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
     name = Column(String, nullable=False, unique=True)
+    public_url = Column(Text, nullable=True)  # where the deployed app lives (its Cloudflare tunnel hostname)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     processes = relationship("Process", back_populates="project", cascade="all, delete-orphan")

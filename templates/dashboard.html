@@ -29,6 +29,9 @@
         <div style="font-size:1.4em; font-weight:700;">{{ project.name }}</div>
       </div>
     </a>
+    {% if project.public_url %}
+    <a href="{{ project.public_url }}" target="_blank" rel="noopener" class="muted" style="display:inline-block; margin-top:4px; color:#6ea8fe;">{{ project.public_url | replace("https://", "") }} &#8599;</a>
+    {% endif %}
     {% if perpetual %}
     <div style="margin-top:10px;">
       <div class="muted" style="margin-bottom:4px;">Perpetual</div>

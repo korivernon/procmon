@@ -60,6 +60,9 @@ def init_db():
             "ALTER TABLE procmon.processes "
             "ADD COLUMN IF NOT EXISTS db_tables JSONB DEFAULT '[]'::jsonb"
         ))
+        conn.execute(text(
+            "ALTER TABLE procmon.projects ADD COLUMN IF NOT EXISTS public_url TEXT"
+        ))
         conn.commit()
 
 

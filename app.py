@@ -339,7 +339,7 @@ def _project_view_data(session_db, project: Project) -> dict:
             "db_bytes_24h": _format_bytes(db_bytes_24h) if p.db_tables else None,
         })
     return {
-        "id": project.id, "name": project.name,
+        "id": project.id, "name": project.name, "public_url": project.public_url,
         "status": pm.compute_project_status(statuses),
         "processes": process_rows,
     }
@@ -406,6 +406,22 @@ def delete_project(project_id):
 # ---------------------------------------------------------------------------
 # Processes
 # ---------------------------------------------------------------------------
+
+@app.route("/projects/<project_id>/link", methods=["POST"])
+@login_required
+def set_project_link(project_id):
+    """The deployed app's public address, shown as a link on the dashboard and project page. cftunnel add sets it
+    on its own when a process here serves the port it tunnels; blank clears it."""
+    url = (request.form.get("public_url") or "").strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    with get_session() as db:
+        project = db.query(Project).filter_by(id=project_id).one_or_none()
+        if project is None:
+            return "No such project", 404
+        project.public_url = url or None
+    return redirect(url_for("project_detail", project_id=project_id))
+
 
 @app.route("/projects/<project_id>/processes", methods=["POST"])
 @login_required

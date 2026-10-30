@@ -2,7 +2,9 @@
 {% block title %}{{ project.name }} -- procmon{% endblock %}
 {% block body %}
 <div class="topbar">
-  <div class="row"><span class="dot {{ project.status }}"></span><h1>{{ project.name }}</h1></div>
+  <div class="row"><span class="dot {{ project.status }}"></span><h1>{{ project.name }}</h1>
+    {% if project.public_url %}<a href="{{ project.public_url }}" target="_blank" rel="noopener" style="margin-left:12px;">{{ project.public_url | replace("https://", "") }} &#8599;</a>{% endif %}
+  </div>
   <div class="actions">
     <a href="{{ url_for('usage_dashboard') }}" class="btn">Usage</a>
     <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
@@ -153,6 +155,12 @@
 <h2 style="font-size:1em; margin-top:20px;">Scheduled</h2>
 {% for p in scheduled_processes %}{{ process_card(p) }}{% endfor %}
 {% endif %}
+
+<form method="post" action="{{ url_for('set_project_link', project_id=project.id) }}" style="margin-top:20px; display:flex; gap:8px; align-items:center;">
+  <span class="muted">Public link</span>
+  <input type="text" name="public_url" value="{{ project.public_url or '' }}" placeholder="https://app.ahiasolutions.com" style="flex:1; max-width:360px;">
+  <button type="submit">Save</button>
+</form>
 
 <form method="post" action="{{ url_for('delete_project', project_id=project.id) }}" style="margin-top:20px;"
       onsubmit="return confirm('Delete project {{ project.name }}? All its processes must be stopped first.');">
