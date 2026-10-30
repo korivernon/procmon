@@ -99,10 +99,75 @@
   form.inline { display: inline; }
   .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  /* Pull-to-refresh: the home-screen app (standalone mode) has no browser
+     pull-down of its own, so the page draws one. The browser's own overscroll
+     refresh is turned off so the two never fire together. */
+  html, body { overscroll-behavior-y: contain; }
+  #ptr {
+    position: fixed; left: 50%; top: calc(env(safe-area-inset-top) + 8px); z-index: 1000;
+    width: 36px; height: 36px; margin-left: -18px; border-radius: 50%;
+    background: var(--card); border: 1px solid var(--border); color: var(--muted);
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+    opacity: 0; transform: translateY(-60px); pointer-events: none;
+  }
+  #ptr.ready { color: var(--text); border-color: #2f6fed; }
+  #ptr.spin span { display: inline-block; animation: ptr-spin 0.8s linear infinite; }
+  @keyframes ptr-spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
 {% block body %}{% endblock %}
+<div id="ptr" aria-hidden="true"><span>&#8635;</span></div>
+<script>
+  // Pull down from the top of the page to reload it. Only a drag that starts
+  // with the page already at the top counts, never one that starts inside a
+  // scrolled log box, and never while typing in a field (a reload would throw
+  // the text away).
+  (() => {
+    const ptr = document.getElementById("ptr");
+    const THRESHOLD = 70;
+    let startY = null, pull = 0;
+    const scrolledInner = (el) => {
+      for (; el && el !== document.body; el = el.parentElement)
+        if (el.scrollTop > 0) return true;
+      return false;
+    };
+    const show = (d) => {
+      ptr.style.opacity = Math.min(1, d / THRESHOLD);
+      ptr.style.transform = `translateY(${Math.min(d, THRESHOLD) - 60 + 20}px) rotate(${d * 3}deg)`;
+      ptr.classList.toggle("ready", d >= THRESHOLD);
+    };
+    const reset = () => {
+      startY = null; pull = 0;
+      ptr.style.transition = "transform 0.2s, opacity 0.2s";
+      ptr.style.opacity = 0; ptr.style.transform = "translateY(-60px)";
+      setTimeout(() => { ptr.style.transition = ""; }, 200);
+    };
+    window.addEventListener("touchstart", (e) => {
+      const typing = document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+      if (window.scrollY > 0 || e.touches.length !== 1 || typing || scrolledInner(e.target)) return;
+      startY = e.touches[0].clientY;
+    }, { passive: true });
+    window.addEventListener("touchmove", (e) => {
+      if (startY === null) return;
+      const dy = e.touches[0].clientY - startY;
+      if (window.scrollY > 0) { reset(); return; }
+      if (dy <= 0) { pull = 0; show(0); return; }   // back above the start: nothing armed, can still pull again
+      pull = dy * 0.5;   // resistance, so it takes a deliberate pull
+      show(pull);
+      if (e.cancelable) e.preventDefault();
+    }, { passive: false });
+    window.addEventListener("touchend", () => {
+      if (startY === null) return;
+      if (pull >= THRESHOLD) {
+        ptr.classList.add("spin");
+        ptr.style.transform = "translateY(20px)";
+        location.reload();
+      } else reset();
+    });
+    window.addEventListener("touchcancel", reset);
+  })();
+</script>
 <script>
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => {
