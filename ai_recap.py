@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # ----------------------------------------------------------------------------
 # Module     : procmon/ai_recap.py
-# Description: The daily AI usage email, sent at 5 PM Eastern for the 24 hours before it. Plain arithmetic over what
+# Description: The daily AI usage email, sent at 5 PM Eastern: today (midnight to the send) and the month so far. Plain arithmetic over what
 #              procmon already records -- no AI writes it (asked 11/07: "daily ai usage recap ... email", "that
 #              doesn't use ai", "sent everyday at 5pm").
 #
@@ -41,16 +41,6 @@ RUNAWAY_CALLS_PER_HOUR = 40         # one app making this many calls in an hour 
 TOP_SESSIONS = 6
 
 
-def window_ending(end: datetime | None = None):
-    """(start, end) as aware ET datetimes: the 24 hours ending at the last 5 PM (or at `end`)."""
-    if end is None:
-        now = datetime.now(ET)
-        end = now.replace(hour=SEND_HOUR, minute=0, second=0, microsecond=0)
-        if end > now:
-            end -= timedelta(days=1)
-    return end - timedelta(hours=24), end
-
-
 def _utc_naive(dt):
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -79,7 +69,7 @@ def _row_cost(r):
     return None if redo is None else redo
 
 
-def apps(start, end):
+def apps(start, end, compare=True):
     with get_session() as db:
         rows = _app_rows(db, start, end)
         hours = db.execute(text("""
@@ -89,7 +79,7 @@ def apps(start, end):
             GROUP BY 1, 2 HAVING count(*) >= :n ORDER BY 1, 2
         """), {"s": _utc_naive(start), "e": _utc_naive(end), "n": RUNAWAY_CALLS_PER_HOUR}).mappings().all()
         prior = []                          # earlier 24h windows that had any calls at all (tracking began 11/05)
-        for d in range(1, 8):
+        for d in (range(1, 8) if compare else ()):
             ps, pe = start - timedelta(days=d), end - timedelta(days=d)
             rows_d = _app_rows(db, ps, pe)
             if rows_d:
@@ -204,11 +194,12 @@ def claude_code(start, end):
                     continue
                 if not s_utc <= t < e_utc:
                     continue
-                seen[mid] = (d.get("sessionId") or "?", project_dir, model, u)
+                seen[mid] = (d.get("sessionId") or "?", project_dir, model, u, t)
 
     models = defaultdict(lambda: {"responses": 0, "inp": 0, "out": 0, "cw": 0, "cr": 0, "cost": 0.0, "unpriced": 0})
     sessions = defaultdict(lambda: {"cost": 0.0, "responses": 0, "models": defaultdict(float), "dir": ""})
-    for sid, pdir, model, u in seen.values():
+    days = defaultdict(float)               # ET date -> cost
+    for sid, pdir, model, u, when in seen.values():
         inp, out = u.get("input_tokens") or 0, u.get("output_tokens") or 0
         cw, cr = u.get("cache_creation_input_tokens") or 0, u.get("cache_read_input_tokens") or 0
         ws = ((u.get("server_tool_use") or {}).get("web_search_requests")) or 0
@@ -228,9 +219,23 @@ def claude_code(start, end):
             mm["cost"] += cost
             s["cost"] += cost
             s["models"][model] += cost
+            days[when.astimezone(ET).date()] += cost
     for sid, s in sessions.items():
         s["title"] = titles.get(sid) or _short_dir(s["dir"])
-    return {"models": dict(models), "sessions": sessions, "total": sum(m["cost"] for m in models.values())}
+    return {"models": dict(models), "sessions": sessions, "days": days,
+            "total": sum(m["cost"] for m in models.values())}
+
+
+def app_days(start, end):
+    """ET date -> app cost, one day at a time from start to end."""
+    out = {}
+    with get_session() as db:
+        d = start
+        while d < end:
+            nxt = min((d + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0), end)
+            out[d.date()] = sum(c for c in (_row_cost(r) for r in _app_rows(db, d, nxt)) if c)
+            d = nxt
+    return out
 
 
 def _short_dir(d):
@@ -269,10 +274,8 @@ def _hour(dt):
     return dt.strftime("%-I %p").lower().replace(" ", "")
 
 
-def build(start, end):
-    a, c = apps(start, end), claude_code(start, end)
-    span = f"{start.strftime('%a %b %-d')} 5pm – {end.strftime('%a %b %-d')} 5pm ET"
-    subject = f"AI usage {end.strftime('%a %b %-d')} · apps {_usd(a['total'])} · Claude Code ~{_usd(c['total'])}"
+def _section(title, span, a, c, days=None):
+    """One period of the email: (text lines, html parts)."""
 
     notes = []
     for r in a["runaways"]:
@@ -316,7 +319,7 @@ def build(start, end):
         return ", ".join(f"{_model(m)} ×{n}" for m, n in sorted(p["models"].items(), key=lambda kv: -kv[1]))
 
     # plain text
-    t = [f"AI usage, {span}", "",
+    t = [title.upper(), span, "",
          f"Apps (API keys): {_usd(a['total'])}   {_avg_label(a)}",
          f"Claude Code (subscription, at API rates): ~{_usd(c['total'])}", ""]
     if notes:
@@ -341,9 +344,10 @@ def build(start, end):
         for s in sessions:
             top = max(s["models"], key=s["models"].get) if s["models"] else ""
             t.append(f"  ~{_usd(s['cost']):>9}  {s['title'][:60]}  ({_model(top)}, {s['responses']} replies)")
-    t += ["", "Claude Code is covered by the subscription; only use past the plan is billed, as extra usage.",
-          f"Levers and live numbers: {os.environ.get('PROCMON_BASE_URL', 'http://127.0.0.1:8600').rstrip('/')}/ai"]
-    body = "\n".join(t)
+    if days:
+        t += ["", "By day"]
+        for day, (ac, cc) in days:
+            t.append(f"  {day.strftime('%a %b %-d'):<11} apps {_usd(ac):>9}   Claude Code ~{_usd(cc):>9}")
 
     # html
     e = _html.escape
@@ -357,7 +361,7 @@ def build(start, end):
                     + "</tr>" for r in rows)
         return f'<table style="border-collapse:collapse;font-size:14px;margin:6px 0 18px">{"<tr>" + h + "</tr>"}{b}</table>'
 
-    parts = [f'<div style="font-family:-apple-system,Segoe UI,sans-serif;color:#111;max-width:680px">',
+    parts = [f"<h2 style='margin:18px 0 2px'>{e(title)}</h2>",
              f'<p style="color:#666;margin:0 0 10px">{e(span)}</p>',
              '<table style="border-collapse:collapse;margin-bottom:16px"><tr>'
              f'<td style="padding:8px 28px 8px 0"><div style="font-size:26px;font-weight:700">{_usd(a["total"])}</div>'
@@ -389,11 +393,45 @@ def build(start, end):
         parts.append(table(["Session", "At API rates", "Replies", "Mostly"],
                            [[s["title"][:70], "~" + _usd(s["cost"]), s["responses"],
                              _model(max(s["models"], key=s["models"].get)) if s["models"] else ""] for s in sessions]))
-    parts.append('<p style="color:#666;font-size:13px">Claude Code is covered by the subscription; only use past the '
-                 'plan is billed, as extra usage. '
-                 f'<a href="{e(os.environ.get("PROCMON_BASE_URL", "http://127.0.0.1:8600").rstrip("/"))}/ai">'
-                 'Levers and live numbers</a></p></div>')
-    return subject, body, "".join(parts)
+    if days:
+        parts.append("<h3 style='margin:8px 0 0'>By day</h3>")
+        parts.append(table(["Day", "Apps", "Claude Code"],
+                           [[day.strftime("%a %b %-d"), _usd(ac), "~" + _usd(cc)] for day, (ac, cc) in days]))
+    return t, parts
+
+
+def window(now: datetime | None = None):
+    """(today's midnight, start of the month, end) in ET; end is now, or 5 PM for the scheduled send."""
+    end = now or datetime.now(ET)
+    day = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day, day.replace(day=1), end
+
+
+def build(now: datetime | None = None):
+    day, month, end = window(now)
+    a_day, c_day = apps(day, end), claude_code(day, end)
+    a_mon, c_mon = apps(month, end, compare=False), claude_code(month, end)
+    app_by_day = app_days(month, end)
+    days = sorted(((d, (app_by_day.get(d, 0.0), c_mon["days"].get(d, 0.0)))
+                   for d in set(app_by_day) | set(c_mon["days"])), reverse=True)
+    clock = end.strftime("%-I:%M %p").lower().replace(":00", "")
+    month_name = end.strftime("%B")
+    subject = (f"AI usage {end.strftime('%a %b %-d')} · today {_usd(a_day['total'])} apps + "
+               f"~{_usd(c_day['total'])} Claude Code · {end.strftime('%b')} so far {_usd(a_mon['total'])} + "
+               f"~{_usd(c_mon['total'])}")
+    t1, h1 = _section("Today", f"{end.strftime('%a %b %-d')}, midnight to {clock} ET", a_day, c_day)
+    t2, h2 = _section(f"{month_name} so far", f"{month.strftime('%b %-d')} to {end.strftime('%b %-d')}, {clock} ET"
+                      " (app tracking began Nov 5)", a_mon, c_mon, days=days)
+    foot = ("Claude Code is covered by the subscription; only use past the plan is billed, as extra usage. "
+            "Its figures are what the same tokens would cost at API list rates.")
+    url = os.environ.get("PROCMON_BASE_URL", "http://127.0.0.1:8600").rstrip("/") + "/ai"
+    body = "\n".join(t1 + ["", ""] + t2 + ["", foot, f"Levers and live numbers: {url}"])
+    html = ('<div style="font-family:-apple-system,Segoe UI,sans-serif;color:#111;max-width:680px">' + "".join(h1)
+            + '<hr style="border:0;border-top:1px solid #ddd;margin:22px 0 6px">' + "".join(h2)
+            + f'<p style="color:#666;font-size:13px">{_html.escape(foot)} <a href="{_html.escape(url)}">Levers and '
+              'live numbers</a></p></div>')
+    return subject, body, html
+
 
 
 def send_daily():
@@ -402,7 +440,7 @@ def send_daily():
         logger.info("AI recap skipped: PROCMON_NOTIFY_EMAIL is not set")
         return
     try:
-        subject, body, html = build(*window_ending())
+        subject, body, html = build()
         emailer.send_email(emailer.PROCMON_NOTIFY_EMAIL, subject, body, html=html)
         logger.info("AI recap sent: %s", subject)
     except Exception:
@@ -423,5 +461,5 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO)
         send_daily()
     else:
-        subj, text_body, _ = build(*window_ending())
+        subj, text_body, _ = build()
         print(subj, "\n", text_body, sep="")

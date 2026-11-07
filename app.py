@@ -1199,7 +1199,7 @@ def create_app():
     init_db()
     _autostart_processes()
     _register_all_scheduled_jobs()
-    # The daily AI usage email at 5 PM Eastern, for the 24 hours before it (ai_recap.py). A procmon that was down at
+    # The daily AI usage email at 5 PM Eastern: today so far and the month so far (ai_recap.py). A procmon that was down at
     # 5 still sends it within the next 3 hours rather than skipping the day.
     scheduler.add_job(ai_recap.send_daily, CronTrigger(hour=ai_recap.SEND_HOUR, minute=0, timezone=ai_recap.ET),
                       id="ai_recap", replace_existing=True, misfire_grace_time=3 * 3600, coalesce=True)
