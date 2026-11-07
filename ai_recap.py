@@ -1,7 +1,8 @@
 #!/usr/bin/python3
 # ----------------------------------------------------------------------------
 # Module     : procmon/ai_recap.py
-# Description: The daily AI usage email, sent at 5 PM Eastern: today (midnight to the send) and the month so far. Plain arithmetic over what
+# Description: The daily AI usage email, sent at 5 PM Eastern: today (midnight to the send), the last 7 days
+#              and the month so far. Plain arithmetic over what
 #              procmon already records -- no AI writes it (asked 11/07: "daily ai usage recap ... email", "that
 #              doesn't use ai", "sent everyday at 5pm").
 #
@@ -395,9 +396,50 @@ def _section(title, span, a, c, days=None):
                              _model(max(s["models"], key=s["models"].get)) if s["models"] else ""] for s in sessions]))
     if days:
         parts.append("<h3 style='margin:8px 0 0'>By day</h3>")
+        parts.append(_day_chart(days))
         parts.append(table(["Day", "Apps", "Claude Code"],
                            [[day.strftime("%a %b %-d"), _usd(ac), "~" + _usd(cc)] for day, (ac, cc) in days]))
     return t, parts
+
+
+CC_COLOR, APP_COLOR = "#2a78d6", "#eb6834"     # categorical slots 1 and 2 of the validated default palette
+
+
+def _day_chart(days):
+    """A stacked bar per day (Claude Code, then apps), drawn with table cells: email clients run no script and Gmail
+    drops SVG, so plain HTML is what every client draws. The table under it carries the exact numbers."""
+    rows = sorted(days)                                  # oldest first, top to bottom
+    top = max((ac + cc for _, (ac, cc) in rows), default=0) or 1
+    sw = lambda c: (f'<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:{c};'
+                    'vertical-align:middle;margin-right:5px"></span>')
+    legend = (f'<div style="font-size:12px;color:#555;margin:6px 0 4px">{sw(CC_COLOR)}Claude Code (at API rates)'
+              f'&nbsp;&nbsp;&nbsp;{sw(APP_COLOR)}Apps</div>')
+    out = [legend, '<table style="border-collapse:collapse;width:100%;max-width:640px;font-size:12px;margin-bottom:8px">']
+    for d, (ac, cc) in rows:
+        w_cc, w_ap = cc / top * 100, ac / top * 100
+        segs = []
+        if w_cc >= 0.2:
+            segs.append((w_cc, CC_COLOR))
+        if w_ap >= 0.2:
+            segs.append((max(w_ap, 0.6), APP_COLOR))       # a sliver stays visible next to a big Claude Code day
+        cells = ""
+        for i, (w, c) in enumerate(segs):
+            last = i == len(segs) - 1
+            gap = "" if last else "border-right:2px solid #ffffff;"
+            radius = "border-radius:0 4px 4px 0;" if last else ""
+            cells += (f'<td style="width:{w:.2f}%;background:{c};height:14px;padding:0;{gap}{radius}'
+                      'font-size:0;line-height:0">&nbsp;</td>')
+        rest = 100 - sum(w for w, _ in segs)
+        if rest > 0.1:
+            cells += f'<td style="width:{rest:.2f}%;padding:0;font-size:0;line-height:0">&nbsp;</td>'
+        bar = (f'<table style="border-collapse:collapse;width:100%;table-layout:fixed;border-left:1px solid #bbb">'
+               f'<tr>{cells}</tr></table>')
+        out.append(f'<tr><td style="padding:3px 8px 3px 0;color:#555;white-space:nowrap;width:76px">'
+                   f'{d.strftime("%a %b %-d")}</td><td style="padding:3px 0">{bar}</td>'
+                   f'<td style="padding:3px 0 3px 8px;color:#111;white-space:nowrap;text-align:right;width:64px">'
+                   f'{_usd(ac + cc)}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
 
 
 def window(now: datetime | None = None):
@@ -410,23 +452,34 @@ def window(now: datetime | None = None):
 def build(now: datetime | None = None):
     day, month, end = window(now)
     a_day, c_day = apps(day, end), claude_code(day, end)
-    a_mon, c_mon = apps(month, end, compare=False), claude_code(month, end)
-    app_by_day = app_days(month, end)
-    days = sorted(((d, (app_by_day.get(d, 0.0), c_mon["days"].get(d, 0.0)))
-                   for d in set(app_by_day) | set(c_mon["days"])), reverse=True)
+    week = day - timedelta(days=6)          # the last 7 days, today included
+    first = min(week, month)
+    a_mon, c_mon = apps(month, end, compare=False), claude_code(first, end)
+    a_wk = apps(week, end, compare=False)
+    c_wk = claude_code(week, end)
+    app_by_day = app_days(first, end)
+    all_days = sorted(((d, (app_by_day.get(d, 0.0), c_mon["days"].get(d, 0.0)))
+                       for d in set(app_by_day) | set(c_mon["days"])), reverse=True)
+    days = [x for x in all_days if x[0] >= month.date()]
+    week_days = [x for x in all_days if x[0] >= week.date()]
+    if first < month:                       # early in the month the week reaches back past the 1st
+        c_mon = claude_code(month, end)
     clock = end.strftime("%-I:%M %p").lower().replace(":00", "")
     month_name = end.strftime("%B")
     subject = (f"AI usage {end.strftime('%a %b %-d')} · today {_usd(a_day['total'])} apps + "
-               f"~{_usd(c_day['total'])} Claude Code · {end.strftime('%b')} so far {_usd(a_mon['total'])} + "
-               f"~{_usd(c_mon['total'])}")
+               f"~{_usd(c_day['total'])} Claude Code · 7 days {_usd(a_wk['total'])} + ~{_usd(c_wk['total'])} · "
+               f"{end.strftime('%b')} {_usd(a_mon['total'])} + ~{_usd(c_mon['total'])}")
     t1, h1 = _section("Today", f"{end.strftime('%a %b %-d')}, midnight to {clock} ET", a_day, c_day)
+    tw, hw = _section("Last 7 days", f"{week.strftime('%a %b %-d')} to {end.strftime('%a %b %-d')}, {clock} ET",
+                      a_wk, c_wk, days=week_days)
     t2, h2 = _section(f"{month_name} so far", f"{month.strftime('%b %-d')} to {end.strftime('%b %-d')}, {clock} ET"
                       " (app tracking began Nov 5)", a_mon, c_mon, days=days)
     foot = ("Claude Code is covered by the subscription; only use past the plan is billed, as extra usage. "
             "Its figures are what the same tokens would cost at API list rates.")
     url = os.environ.get("PROCMON_BASE_URL", "http://127.0.0.1:8600").rstrip("/") + "/ai"
-    body = "\n".join(t1 + ["", ""] + t2 + ["", foot, f"Levers and live numbers: {url}"])
+    body = "\n".join(t1 + ["", ""] + tw + ["", ""] + t2 + ["", foot, f"Levers and live numbers: {url}"])
     html = ('<div style="font-family:-apple-system,Segoe UI,sans-serif;color:#111;max-width:680px">' + "".join(h1)
+            + '<hr style="border:0;border-top:1px solid #ddd;margin:22px 0 6px">' + "".join(hw)
             + '<hr style="border:0;border-top:1px solid #ddd;margin:22px 0 6px">' + "".join(h2)
             + f'<p style="color:#666;font-size:13px">{_html.escape(foot)} <a href="{_html.escape(url)}">Levers and '
               'live numbers</a></p></div>')
