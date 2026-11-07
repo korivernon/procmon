@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import smtplib
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -103,7 +104,7 @@ def app_subject(subject, app):
     return s if s.lower().startswith(app.lower() + ":") else f"{app}: {s}"
 
 
-def send_email(to_address: str, subject: str, body: str) -> None:
+def send_email(to_address: str, subject: str, body: str, html: str | None = None) -> None:
     # to_address may be a single address or a "," / ";" separated list (e.g.
     # PROCMON_NOTIFY_EMAIL="a@x.com,b@y.com") -- split it out so each name
     # actually lands in the SMTP envelope's RCPT TO instead of being sent as
@@ -111,7 +112,12 @@ def send_email(to_address: str, subject: str, body: str) -> None:
     recipients = [addr.strip() for addr in to_address.replace(";", ",").split(",") if addr.strip()]
 
     settings = _smtp_settings()
-    msg = MIMEText(body)
+    if html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "plain"))
+        msg.attach(MIMEText(html, "html"))
+    else:
+        msg = MIMEText(body)
     msg["Subject"] = app_subject(subject, "procmon")
     msg["From"] = settings["from_email"]
     msg["To"] = ", ".join(recipients)

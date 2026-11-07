@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}AI -- procmon{% endblock %}
+{% block body %}
+<div class="topbar">
+  <h1>AI</h1>
+  <a href="{{ url_for('dashboard') }}" class="btn">&larr; All projects</a>
+</div>
+
+<div class="muted" style="margin-bottom:12px;">
+  AI calls from every process procmon starts. A lever takes effect within about 15 seconds. A process is only
+  counted once it has been restarted since this was added.
+</div>
+
+<div class="actions" style="margin-bottom:10px;">
+  <button type="button" class="window-btn" data-window="24h">24h</button>
+  <button type="button" class="window-btn" data-window="7d">7d</button>
+  <button type="button" class="window-btn" data-window="30d">30d</button>
+</div>
+
+<div id="total" class="card" style="margin-bottom:14px;"><div class="muted">Loading&hellip;</div></div>
+<div id="rows"></div>
+
+<style>
+  .window-btn.active { background: #2f6fed; border-color: #2f6fed; }
+  .ai-cols { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+  .ai-cols > :first-child { flex:1 0 38%; min-width:0; }
+  .ai-name { font-weight:600; overflow-wrap:anywhere; }
+  .ai-right { display:flex; align-items:center; gap:12px; flex:0 1 auto; min-width:0; }
+  .ai-nums { text-align:right; font-variant-numeric:tabular-nums; }
+  .ai-nums .muted { font-size:0.75em; }
+  .ai-off .ai-name, .ai-off .ai-nums { opacity:0.5; }
+  .ai-project-head { cursor:pointer; }
+  .ai-cats { margin-top:10px; padding-top:6px; border-top:1px solid var(--border); }
+  .ai-cat { padding:7px 0; font-size:0.9em; }
+  .lever { position:relative; width:44px; height:26px; padding:0; border-radius:13px; flex-shrink:0;
+           background:#3a3f4b; border:none; cursor:pointer; transition:background .15s; }
+  .lever::after { content:""; position:absolute; top:3px; left:3px; width:20px; height:20px; border-radius:50%;
+                  background:#fff; transition:left .15s; }
+  .lever[aria-checked="true"] { background:var(--green); }
+  .lever[aria-checked="true"]::after { left:21px; }
+  .lever:disabled { opacity:0.5; cursor:default; }
+  .off-tag { color:var(--red); font-size:0.8em; font-weight:600; }
+</style>
+
+<script>
+let data = null, currentWindow = "24h", busy = false;
+const expanded = new Set();
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function money(w) {
+  if (w.cost === 0 && w.unpriced) return "unpriced";
+  const cost = w.cost >= 100 ? `$${w.cost.toFixed(0)}` : `$${w.cost.toFixed(2)}`;
+  return w.unpriced ? `${cost} + unpriced` : cost;
+}
+
+function tokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
+  return String(n);
+}
+
+function detail(w) {
+  const parts = [`${w.calls} call${w.calls === 1 ? "" : "s"}`, `${tokens(w.tokens)} tokens`];
+  if (w.errors) parts.push(`${w.errors} failed`);
+  if (w.blocked) parts.push(`${w.blocked} blocked`);
+  return parts.join(" · ");
+}
+
+function lever(on, label, attrs) {
+  return `<button type="button" class="lever" role="switch" aria-checked="${on}" aria-label="${esc(label)}" ${attrs}></button>`;
+}
+
+function render() {
+  if (!data) return;
+  let cost = 0, calls = 0, blocked = 0, toks = 0, unpriced = 0, errors = 0;
+  for (const p of data.projects) {
+    const w = p.windows[currentWindow];
+    cost += w.cost; calls += w.calls; blocked += w.blocked; toks += w.tokens; unpriced += w.unpriced; errors += w.errors;
+  }
+  document.getElementById("total").innerHTML = `<div class="ai-cols">
+    <div class="ai-name">All projects</div>
+    <div class="ai-nums"><div>${money({cost, unpriced})}</div>
+    <div class="muted">${detail({calls, tokens: toks, errors, blocked})}</div></div></div>`;
+
+  const spend = p => p.windows[currentWindow].cost;
+  const sorted = [...data.projects].sort((a, b) => spend(b) - spend(a) || b.windows[currentWindow].calls - a.windows[currentWindow].calls || a.name.localeCompare(b.name));
+  document.getElementById("rows").innerHTML = sorted.map(p => {
+    const w = p.windows[currentWindow];
+    const cats = [...p.categories].sort((a, b) => b.windows[currentWindow].cost - a.windows[currentWindow].cost
+      || b.windows[currentWindow].calls - a.windows[currentWindow].calls || a.name.localeCompare(b.name));
+    const status = !p.enabled ? '<span class="off-tag">AI off</span>'
+      : p.reporting.length ? `Tracking ${esc(p.reporting.join(", "))}` : "No AI seen";
+    const catRows = cats.map(c => {
+      const cw = c.windows[currentWindow];
+      return `<div class="ai-cols ai-cat ${c.enabled && p.enabled ? "" : "ai-off"}">
+        <div><div class="ai-name" style="font-weight:500">${esc(c.name)}</div><div class="muted">${detail(cw)}</div></div>
+        <div class="ai-right"><div class="ai-nums">${money(cw)}</div>
+        ${lever(c.enabled, `AI for ${c.name}`, `data-project="${esc(p.id)}" data-category="${esc(c.name)}" ${p.enabled ? "" : "disabled"}`)}</div></div>`;
+    }).join("");
+    return `<div class="card ${p.enabled ? "" : "ai-off-card"}">
+      <div class="ai-cols ai-project-head ${p.enabled ? "" : "ai-off"}" data-toggle="${esc(p.id)}">
+        <div><div class="ai-name">${esc(p.name)}${cats.length ? ` <span class="muted">${expanded.has(p.id) ? "▾" : "▸"} ${cats.length}</span>` : ""}</div>
+        <div class="muted">${status}</div></div>
+        <div class="ai-right"><div class="ai-nums"><div>${money(w)}</div><div class="muted">${detail(w)}</div></div>
+        ${lever(p.enabled, `AI for ${p.name}`, `data-project="${esc(p.id)}" data-category=""`)}</div>
+      </div>
+      ${expanded.has(p.id) && cats.length ? `<div class="ai-cats">${catRows}</div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function load() {
+  if (busy) return;
+  const res = await fetch("{{ url_for('api_ai_summary') }}");
+  if (res.ok) { data = await res.json(); if (!busy) render(); }
+}
+
+document.getElementById("rows").addEventListener("click", async ev => {
+  const button = ev.target.closest(".lever");
+  if (button) {
+    ev.stopPropagation();
+    const on = button.getAttribute("aria-checked") !== "true";
+    const category = button.dataset.category;
+    if (!on && !category) {
+      const name = data.projects.find(p => p.id === button.dataset.project).name;
+      if (!confirm(`Turn off all AI for ${name}? Anything in it that needs AI will fail until you turn this back on.`)) return;
+    }
+    busy = true;
+    button.disabled = true;
+    try {
+      const res = await fetch("{{ url_for('api_ai_lever') }}", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({project_id: button.dataset.project, category, enabled: on})});
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      alert(`Could not change the lever: ${e.message}`);
+    }
+    busy = false;
+    await load();
+    return;
+  }
+  const head = ev.target.closest("[data-toggle]");
+  if (head) {
+    const id = head.dataset.toggle;
+    expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+    render();
+  }
+});
+
+document.querySelectorAll(".window-btn").forEach(b => b.addEventListener("click", () => {
+  currentWindow = b.dataset.window;
+  document.querySelectorAll(".window-btn").forEach(x => x.classList.toggle("active", x === b));
+  render();
+}));
+document.querySelector('.window-btn[data-window="24h"]').classList.add("active");
+load();
+setInterval(load, 15000);
+</script>
+{% endblock %}

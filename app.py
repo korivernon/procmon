@@ -80,6 +80,7 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 
@@ -101,6 +102,9 @@ from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from sqlalchemy import func, text
 
+from procmon import ai_env
+from procmon import ai_recap
+from procmon import ai_usage
 from procmon import emailer
 from procmon import photon_client
 from procmon import process_manager as pm
@@ -711,6 +715,37 @@ def process_logs(process_id):
 _USAGE_WINDOWS = {"24h": timedelta(hours=24), "7d": timedelta(days=7), "30d": timedelta(days=30)}
 
 
+@app.route("/ai")
+@login_required
+def ai_dashboard():
+    return render_template("ai.html")
+
+
+@app.route("/api/ai/summary")
+@login_required
+def api_ai_summary():
+    return jsonify(ai_usage.summary())
+
+
+@app.route("/api/ai/lever", methods=["POST"])
+@login_required
+def api_ai_lever():
+    body = request.get_json(silent=True) or {}
+    if not ai_usage.valid_project_id(body.get("project_id")) or not isinstance(body.get("enabled"), bool):
+        return jsonify({"error": "project_id and enabled are required"}), 400
+    ai_usage.set_lever(body["project_id"], body.get("category") or "", body["enabled"])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ai/sync", methods=["POST"])
+def api_ai_sync():
+    """Called by ai_shim inside each managed app, so it has no browser session: its token is the gate."""
+    supplied = request.headers.get("X-Procmon-AI-Token", "")
+    if not hmac.compare_digest(supplied, ai_env.client_token()):
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(ai_usage.sync(request.get_json(silent=True) or {}))
+
+
 @app.route("/usage")
 @login_required
 def usage_dashboard():
@@ -909,7 +944,7 @@ def _run_scheduled_process(process_id: str) -> None:
                 process.pid = pid
                 process.process_start_time = create_time
 
-    exit_code = pm.run_one_shot(command, working_dir, env_vars, log_path, on_started=_on_started)
+    exit_code = pm.run_one_shot(command, working_dir, env_vars, log_path, on_started=_on_started, process_id=process_id)
 
     with get_session() as db:
         process = db.query(Process).filter_by(id=process_id).one_or_none()
@@ -1164,6 +1199,10 @@ def create_app():
     init_db()
     _autostart_processes()
     _register_all_scheduled_jobs()
+    # The daily AI usage email at 5 PM Eastern, for the 24 hours before it (ai_recap.py). A procmon that was down at
+    # 5 still sends it within the next 3 hours rather than skipping the day.
+    scheduler.add_job(ai_recap.send_daily, CronTrigger(hour=ai_recap.SEND_HOUR, minute=0, timezone=ai_recap.ET),
+                      id="ai_recap", replace_existing=True, misfire_grace_time=3 * 3600, coalesce=True)
     scheduler.start()
     threading.Thread(target=_reconcile_loop, daemon=True).start()
     threading.Thread(target=usage_tracker.sample_loop, daemon=True).start()

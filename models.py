@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
+    BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import declarative_base, relationship
@@ -166,3 +166,46 @@ class UsageSample(Base):
 
     db_bytes_total = Column(BigInteger, nullable=True)
     db_bytes_delta = Column(BigInteger, nullable=False, default=0)
+
+
+class AiLever(Base):
+    """
+    One lever on the /ai page. category "" is the whole project's; a row with a category is that subcategory's, created
+    the first time an app declares or uses it. A project with no row is on.
+    """
+    __tablename__ = "ai_levers"
+    __table_args__ = (
+        UniqueConstraint("project_id", "category", name="uq_ai_lever_project_category"),
+        {"schema": "procmon"},
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    project_id = Column(UUID(as_uuid=False), ForeignKey("procmon.projects.id", ondelete="CASCADE"), nullable=False)
+    category = Column(String, nullable=False, default="")
+    enabled = Column(Boolean, nullable=False, default=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AiCall(Base):
+    """One AI request, as reported by ai_shim. status: ok | error | blocked (a lever refused it). cost is NULL when the
+    model has no known price, never a guess."""
+    __tablename__ = "ai_calls"
+    __table_args__ = (
+        Index("ix_ai_calls_project_created", "project_id", "created_at"),
+        {"schema": "procmon"},
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    project_id = Column(UUID(as_uuid=False), ForeignKey("procmon.projects.id", ondelete="CASCADE"), nullable=False)
+    process_name = Column(String, nullable=True)
+    category = Column(String, nullable=False)
+    provider = Column(String, nullable=True)
+    model = Column(String, nullable=True)
+    status = Column(String, nullable=False)
+    input_tokens = Column(BigInteger, nullable=False, default=0)
+    output_tokens = Column(BigInteger, nullable=False, default=0)
+    cache_write_tokens = Column(BigInteger, nullable=False, default=0)
+    cache_read_tokens = Column(BigInteger, nullable=False, default=0)
+    web_searches = Column(Integer, nullable=False, default=0)
+    cost = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

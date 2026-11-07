@@ -38,6 +38,8 @@ from typing import Optional
 
 import psutil
 
+from procmon import ai_env
+
 logger = logging.getLogger(__name__)
 
 GRACEFUL_STOP_TIMEOUT_SECONDS = 10
@@ -109,6 +111,7 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
 
     full_env = dict(os.environ)
     full_env.update(env_vars or {})
+    full_env.update(ai_env.env_for(process_id, env_vars))
 
     wrapped_command = f"{_duplicate_marker(process_id)} {command}"
 
@@ -431,7 +434,7 @@ def wait_for_exit(pid: int, timeout: Optional[float] = None) -> Optional[int]:
 
 
 def run_one_shot(command: str, working_dir: Optional[str], env_vars: dict, log_path: str,
-                  on_started=None) -> int:
+                  on_started=None, process_id: Optional[str] = None) -> int:
     """
     THE actual, race-free way to run a scheduled/one-shot command and
     get its real exit code -- built specifically to fix a confirmed
@@ -457,6 +460,7 @@ def run_one_shot(command: str, working_dir: Optional[str], env_vars: dict, log_p
 
     full_env = dict(os.environ)
     full_env.update(env_vars or {})
+    full_env.update(ai_env.env_for(process_id, env_vars))
 
     log_file = open(log_path, "a")
     try:

@@ -4,6 +4,7 @@
 <div class="topbar">
   <h1>procmon</h1>
   <div class="actions">
+    <a href="{{ url_for('ai_dashboard') }}" class="btn">AI</a>
     <a href="{{ url_for('usage_dashboard') }}" class="btn">Usage</a>
     <form method="post" action="{{ url_for('logout') }}"><button type="submit">Log out</button></form>
   </div>
