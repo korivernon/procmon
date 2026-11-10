@@ -2,7 +2,7 @@
 {% block title %}procmon{% endblock %}
 {% block body %}
 <div class="topbar">
-  <h1>procmon</h1>
+  <h1>procmon <span class="muted" style="font-size:0.5em; font-weight:400;">{{ machine.name }} · {% if machine.role == "live" %}<span style="color:var(--green)">live</span>{% else %}<span style="color:var(--amber)">standby</span>{% endif %}</span></h1>
   <div class="actions">
     <a href="{{ url_for('ai_dashboard') }}" class="btn">AI</a>
     <a href="{{ url_for('usage_dashboard') }}" class="btn">Usage</a>

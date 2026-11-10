@@ -117,6 +117,12 @@ class Process(Base):
                                                                  # false -- the 8/25 storm retried (and
                                                                  # event-spammed) all night because of it.
 
+    live_only = Column(Boolean, nullable=False, default=False)  # never started on a standby machine
+                                                                    # (machine.py): the trading engines, so
+                                                                    # two machines can't both place orders
+    only_platform = Column(String, nullable=True)  # "darwin" | "linux": runs only there (the iMessage relay
+                                                      # needs a Mac). NULL = anywhere.
+
     created_at = Column(DateTime, default=datetime.utcnow)
 
     project = relationship("Project", back_populates="processes")

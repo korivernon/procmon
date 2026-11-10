@@ -41,6 +41,13 @@
       </label>
     </div>
 
+      <label><input type="checkbox" name="live_only"  style="width:auto; display:inline;"> Only on the live machine (never started on standby: use for anything that places orders)</label>
+      <label>Runs on</label>
+      <select name="only_platform" style="background:#0d0f13;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px;width:100%;margin-bottom:8px;">
+        <option value="" selected>Any machine</option>
+        <option value="darwin" >Mac only</option>
+        <option value="linux" >Linux only</option>
+      </select>
     <div id="perpetual-options">
       <label><input type="checkbox" name="autostart" style="width:auto; display:inline;"> Autostart when procmon boots</label>
     </div>
@@ -68,6 +75,8 @@
       <div>
         <div><strong>{{ p.name }}</strong></div>
         <div class="command" onclick="this.classList.toggle('expanded')" title="Click to see the full command">{{ p.command }}</div>
+        {% if p.off_here %}<div class="muted" style="color:var(--amber)">Off here: {{ p.off_here }}</div>
+        {% elif p.live_only %}<div class="muted">Live machine only</div>{% endif %}
         {% if p.run_mode == "scheduled" %}
           <div class="muted">scheduled: <code>{{ p.schedule_cron }}</code></div>
         {% endif %}
@@ -121,12 +130,19 @@
     <form method="post" action="{{ url_for('edit_process_route', process_id=p.id) }}">
       <label>Name</label>
       <input type="text" name="name" value="{{ p.name }}" required>
-      <label>Command</label>
+      <label>Command <span class="muted">({root} = {{ machine.root }}, {python} = this machine's Python)</span></label>
       <input type="text" name="command" value="{{ p.command }}" required>
       <label>Working directory</label>
       <input type="text" name="working_dir" value="{{ p.working_dir or '' }}">
       <label>Postgres tables this process owns (comma-separated)</label>
       <input type="text" name="db_tables" value="{{ p.db_tables }}" placeholder="pomtrader.executions, pomtrader.positions">
+      <label><input type="checkbox" name="live_only" {% if p.live_only %}checked{% endif %} style="width:auto; display:inline;"> Only on the live machine (never started on standby: use for anything that places orders)</label>
+      <label>Runs on</label>
+      <select name="only_platform" style="background:#0d0f13;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px;width:100%;margin-bottom:8px;">
+        <option value="" {% if not p.only_platform %}selected{% endif %}>Any machine</option>
+        <option value="darwin" {% if p.only_platform == 'darwin' %}selected{% endif %}>Mac only</option>
+        <option value="linux" {% if p.only_platform == 'linux' %}selected{% endif %}>Linux only</option>
+      </select>
       {% if p.run_mode == "perpetual" %}
       <label><input type="checkbox" name="autostart" {% if p.autostart %}checked{% endif %} style="width:auto; display:inline;"> Autostart when procmon boots</label>
       <div class="muted" style="margin-top:4px; margin-bottom:8px;">Command changes take effect on the next start/restart, not immediately.</div>

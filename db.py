@@ -30,6 +30,11 @@ DATABASE_URL = os.environ.get(
     "PROCMON_DATABASE_URL",
     "postgresql+psycopg2://admin@127.0.0.1:5433/postgres",
 )
+# procmon itself follows the machine's database host/port (PROCMON_DB_HOST / PROCMON_DB_PORT), like every process
+# it starts.
+from procmon import machine as _machine  # noqa: E402
+if _machine.db_target():
+    DATABASE_URL = _machine.rewrite_url(DATABASE_URL, *_machine.db_target())
 
 _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
@@ -62,6 +67,12 @@ def init_db():
         ))
         conn.execute(text(
             "ALTER TABLE procmon.projects ADD COLUMN IF NOT EXISTS public_url TEXT"
+        ))
+        conn.execute(text(
+            "ALTER TABLE procmon.processes ADD COLUMN IF NOT EXISTS live_only BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
+        conn.execute(text(
+            "ALTER TABLE procmon.processes ADD COLUMN IF NOT EXISTS only_platform VARCHAR"
         ))
         conn.commit()
 

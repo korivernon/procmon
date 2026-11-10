@@ -39,6 +39,7 @@ from typing import Optional
 import psutil
 
 from procmon import ai_env
+from procmon import machine
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +110,13 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
+    # Stored commands say {root} / {python}; this machine's paths go in here (machine.py), and the process is told
+    # this machine's database address and role.
+    command, working_dir = machine.expand(command), machine.expand(working_dir)
+
     full_env = dict(os.environ)
     full_env.update(env_vars or {})
+    full_env.update(machine.env_for(command, working_dir, env_vars))
     full_env.update(ai_env.env_for(process_id, env_vars))
 
     wrapped_command = f"{_duplicate_marker(process_id)} {command}"
@@ -297,6 +303,7 @@ def find_running_instance(command: str, exclude_pid: Optional[int] = None) -> Op
     Returns (pid, create_time_str) of the first live match found, or
     None.
     """
+    command = machine.expand(command)
     try:
         target_argv = shlex.split(command)
     except ValueError:
@@ -458,8 +465,13 @@ def run_one_shot(command: str, working_dir: Optional[str], env_vars: dict, log_p
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
+    # Stored commands say {root} / {python}; this machine's paths go in here (machine.py), and the process is told
+    # this machine's database address and role.
+    command, working_dir = machine.expand(command), machine.expand(working_dir)
+
     full_env = dict(os.environ)
     full_env.update(env_vars or {})
+    full_env.update(machine.env_for(command, working_dir, env_vars))
     full_env.update(ai_env.env_for(process_id, env_vars))
 
     log_file = open(log_path, "a")

@@ -106,6 +106,7 @@ from procmon import ai_env
 from procmon import ai_recap
 from procmon import ai_usage
 from procmon import emailer
+from procmon import machine
 from procmon import photon_client
 from procmon import process_manager as pm
 from procmon import usage_tracker
@@ -130,6 +131,12 @@ PROCMON_NOTIFY_PHONE = os.environ.get("PROCMON_NOTIFY_PHONE", "")
 
 logger = logging.getLogger(__name__)
 scheduler = BackgroundScheduler()
+
+
+@app.context_processor
+def _machine_context():
+    return {"machine": {"name": machine.name(), "role": machine.role(), "platform": machine.platform(),
+                        "root": machine.root(), "db": machine.db_target()}}
 
 
 def _process_page_link(project_id: str) -> str:
@@ -298,8 +305,16 @@ def logout():
 # Dashboard / projects
 # ---------------------------------------------------------------------------
 
+def _here(p: Process) -> tuple[bool, str]:
+    """Whether this process may run on this machine (machine.py): (ok, why not)."""
+    return machine.allowed(bool(p.live_only), p.only_platform)
+
+
 def _process_status(p: Process) -> str:
-    return pm.compute_process_status(p.run_mode, p.desired_state, p.pid, p.process_start_time, p.last_exit_code)
+    desired = p.desired_state
+    if desired == "running" and not _here(p)[0] and not pm.is_actually_running(p.pid, p.process_start_time):
+        desired = "stopped"         # it's meant to be down here (standby, or the wrong kind of machine): not a crash
+    return pm.compute_process_status(p.run_mode, desired, p.pid, p.process_start_time, p.last_exit_code)
 
 
 def _usage_24h(session_db, process_ids: list[str]) -> dict:
@@ -333,6 +348,8 @@ def _project_view_data(session_db, project: Project) -> dict:
         process_rows.append({
             "id": p.id, "name": p.name, "command": p.command,
             "working_dir": p.working_dir, "autostart": p.autostart,
+            "live_only": bool(p.live_only), "only_platform": p.only_platform or "",
+            "off_here": "" if _here(p)[0] else _here(p)[1],
             "status": status, "desired_state": p.desired_state,
             "run_mode": p.run_mode, "schedule_cron": p.schedule_cron,
             "db_tables": ", ".join(p.db_tables or []),
@@ -432,11 +449,14 @@ def set_project_link(project_id):
 @login_required
 def create_process(project_id):
     name = request.form.get("name", "").strip()
-    command = request.form.get("command", "").strip()
-    working_dir = request.form.get("working_dir", "").strip() or None
+    # Stored with {root} / {python} in place of this machine's paths, so the same list runs on every machine.
+    command = machine.portable(request.form.get("command", "").strip())
+    working_dir = machine.portable(request.form.get("working_dir", "").strip()) or None
     run_mode = request.form.get("run_mode", "perpetual")
     schedule_cron = request.form.get("schedule_cron", "").strip() or None
     autostart = request.form.get("autostart") == "on"
+    live_only = request.form.get("live_only") == "on"
+    only_platform = request.form.get("only_platform", "").strip() or None
     db_tables = _parse_db_tables(request.form.get("db_tables", ""))
 
     if not name or not command:
@@ -467,6 +487,7 @@ def create_process(project_id):
             project_id=project_id, name=name, command=command, working_dir=working_dir,
             autostart=autostart, desired_state="stopped",
             run_mode=run_mode, schedule_cron=schedule_cron, db_tables=db_tables,
+            live_only=live_only, only_platform=only_platform,
         )
         db.add(process)
         db.flush()
@@ -498,11 +519,13 @@ def edit_process_route(process_id):
     doesn't lose or split existing log history across two files.
     """
     name = request.form.get("name", "").strip()
-    command = request.form.get("command", "").strip()
-    working_dir = request.form.get("working_dir", "").strip() or None
+    command = machine.portable(request.form.get("command", "").strip())
+    working_dir = machine.portable(request.form.get("working_dir", "").strip()) or None
     autostart = request.form.get("autostart") == "on"
     schedule_cron = request.form.get("schedule_cron", "").strip() or None
     db_tables = _parse_db_tables(request.form.get("db_tables", ""))
+    live_only = request.form.get("live_only") == "on"
+    only_platform = request.form.get("only_platform", "").strip() or None
 
     if not name or not command:
         return "Both name and command are required", 400
@@ -533,6 +556,8 @@ def edit_process_route(process_id):
         process.command = command
         process.working_dir = working_dir
         process.db_tables = db_tables
+        process.live_only = live_only
+        process.only_platform = only_platform
         process.auto_restart_abandoned = False  # an edit is exactly the "fixed and started manually"
                                                     # human intervention abandonment waits for -- the
                                                     # corrected command deserves a fresh crash budget
@@ -558,6 +583,9 @@ def start_process_route(process_id):
 
         if _process_status(process) == "green":
             return redirect(url_for("project_detail", project_id=process.project_id))
+        ok_here, why = _here(process)
+        if not ok_here:
+            return f"Not started: {why}.", 409
 
         killed = pm.kill_duplicate_processes(process.id, exclude_pid=process.pid)
         if killed:
@@ -930,6 +958,8 @@ def _run_scheduled_process(process_id: str) -> None:
         process = db.query(Process).filter_by(id=process_id).one_or_none()
         if process is None or process.run_mode != "scheduled":
             return  # deleted or changed run_mode since this job was registered
+        if not _here(process)[0]:
+            return  # not this machine's job (standby, or the wrong kind of machine)
         command, working_dir, env_vars, log_path = process.command, process.working_dir, process.env_vars or {}, process.log_path
         process.desired_state = "running"  # for the DURATION of this run only -- lets status
                                               # correctly show green while a longer scheduled job
@@ -971,6 +1001,8 @@ def _autostart_processes():
         to_start = db.query(Process).filter_by(autostart=True, run_mode="perpetual").all()
         for process in to_start:
             if _process_status(process) == "green":
+                continue
+            if not _here(process)[0]:
                 continue
             # ADOPT before spawning: kill_duplicate_processes below only
             # matches procmon's own marker-wrapped instances -- a live
@@ -1109,6 +1141,8 @@ def _reconcile_loop():
                 for process in running_desired:
                     if pm.is_actually_running(process.pid, process.process_start_time):
                         continue
+                    if not _here(process)[0]:
+                        continue    # meant to be down on this machine: neither a crash nor something to restart
 
                     # DURABLE abandonment: once the crash-loop backstop has
                     # tripped, this process gets no more "crashed" events and
@@ -1195,8 +1229,21 @@ def _reconcile_loop():
         time.sleep(RECONCILE_INTERVAL_SECONDS)
 
 
+def _store_commands_portably():
+    """Every stored command and working dir says {root} / {python} instead of this machine's own paths, so the list
+    copied to another machine runs there as it is. Runs at every start; a row already in that form is left alone."""
+    with get_session() as db:
+        for process in db.query(Process).all():
+            command, working_dir = machine.portable(process.command), machine.portable(process.working_dir)
+            if command != process.command:
+                process.command = command
+            if working_dir != process.working_dir:
+                process.working_dir = working_dir
+
+
 def create_app():
     init_db()
+    _store_commands_portably()
     _autostart_processes()
     _register_all_scheduled_jobs()
     # The daily AI usage email at 5 PM Eastern: today so far and the month so far (ai_recap.py). A procmon that was down at
