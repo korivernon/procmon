@@ -152,6 +152,7 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
     builtin that does nothing and produces no output, so this doesn't
     change what the command actually does or logs.
     """
+    log_path = log_path or os.path.join(machine.log_dir(), f"{process_id or 'process'}.log")   # a row made by hand
     log_dir = os.path.dirname(log_path)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
@@ -510,6 +511,7 @@ def run_one_shot(command: str, working_dir: Optional[str], env_vars: dict, log_p
     without needing a second start_process()-style call that would
     reintroduce the exact race this function exists to avoid.
     """
+    log_path = log_path or os.path.join(machine.log_dir(), f"{process_id or 'process'}.log")   # a row made by hand
     log_dir = os.path.dirname(log_path)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
