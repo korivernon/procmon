@@ -41,6 +41,50 @@ import psutil
 from procmon import ai_env
 from procmon import machine
 
+IS_WINDOWS = os.name == "nt"
+
+
+def _popen_group_kwargs() -> dict:
+    """Its own process group, so a stop reaches the whole tree a shell command starts."""
+    if IS_WINDOWS:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+def _signal_tree(pid: int, force: bool = False) -> None:
+    """SIGTERM (or SIGKILL) to the process group on Mac/Linux. Windows has no process-group signals, so the process
+    and everything under it is terminated (terminate and kill are both TerminateProcess there). Raises
+    ProcessLookupError when it's already gone, PermissionError when it can't be touched."""
+    if not IS_WINDOWS:
+        os.killpg(os.getpgid(pid), signal.SIGKILL if force else signal.SIGTERM)
+        return
+    try:
+        root = psutil.Process(pid)
+        family = root.children(recursive=True) + [root]
+    except psutil.NoSuchProcess:
+        raise ProcessLookupError(pid) from None
+    except psutil.AccessDenied:
+        raise PermissionError(pid) from None
+    for p in family:
+        try:
+            p.kill() if force else p.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            raise PermissionError(p.pid) from None
+
+
+def _shell_body(cmdline: list) -> Optional[str]:
+    """The command text a shell wrapper is running ("sh -c X" / "cmd.exe /c X"), or None if this isn't one."""
+    if len(cmdline) < 3:
+        return None
+    if not IS_WINDOWS:
+        return cmdline[2] if cmdline[1] == "-c" else None
+    if cmdline[1].lower() != "/c":
+        return None
+    body = " ".join(cmdline[2:])
+    return body[1:-1] if len(body) >= 2 and body[0] == body[-1] == '"' else body
+
 logger = logging.getLogger(__name__)
 
 GRACEFUL_STOP_TIMEOUT_SECONDS = 10
@@ -65,6 +109,8 @@ def _duplicate_marker(process_id: str) -> str:
     marker along with it, since an exec-replaced process's argv becomes
     the target command's own, with no room left for the marker at all.
     """
+    if IS_WINDOWS:      # cmd.exe has no ":" no-op; setting a variable first does the same job and keeps cmd as wrapper
+        return f"set PROCMON_ID_{process_id}=1&&"
     return f": PROCMON_ID_{process_id} ;"
 
 
@@ -131,7 +177,7 @@ def start_process(command: str, working_dir: Optional[str], env_vars: dict, log_
             stdout=log_file,
             stderr=log_file,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # own process group -- lets stop_process() signal the whole
+            **_popen_group_kwargs(),  # own process group -- lets stop_process() signal the whole
                                         # group, not just the immediate shell, so a command like
                                         # "python3 foo.py" spawned via shell=True gets properly
                                         # signalled even though the shell itself is the direct child
@@ -214,11 +260,12 @@ def kill_duplicate_processes(process_id: str, exclude_pid: Optional[int] = None)
         if proc.pid in (exclude_pid, own_pid):
             continue
 
-        if len(cmdline) < 3 or cmdline[1] != "-c" or not cmdline[2].startswith(marker):
+        body = _shell_body(cmdline)
+        if body is None or not body.startswith(marker):
             continue
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            _signal_tree(proc.pid)
             killed.append(proc.pid)
         except (ProcessLookupError, PermissionError):
             continue
@@ -228,7 +275,7 @@ def kill_duplicate_processes(process_id: str, exclude_pid: Optional[int] = None)
         for pid in killed:
             try:
                 if psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    _signal_tree(pid, force=True)
             except (ProcessLookupError, PermissionError, psutil.NoSuchProcess):
                 pass
     return killed
@@ -305,7 +352,7 @@ def find_running_instance(command: str, exclude_pid: Optional[int] = None) -> Op
     """
     command = machine.expand(command)
     try:
-        target_argv = shlex.split(command)
+        target_argv = shlex.split(command, posix=not IS_WINDOWS)
     except ValueError:
         target_argv = None  # unbalanced quotes etc -- exec-replaced form just won't match;
                                 # the shell-wrapper form (an exact string compare) still can
@@ -320,7 +367,7 @@ def find_running_instance(command: str, exclude_pid: Optional[int] = None) -> Op
         except (psutil.Error, OSError):
             continue
 
-        is_shell_wrapper = len(cmdline) == 3 and cmdline[1] == "-c" and cmdline[2] == command
+        is_shell_wrapper = _shell_body(cmdline) == command
         is_exec_replaced = target_argv is not None and cmdline == target_argv
         if not (is_shell_wrapper or is_exec_replaced):
             continue
@@ -367,7 +414,7 @@ def stop_process(pid: Optional[int], expected_create_time: Optional[str], reap: 
         return True  # already gone -- nothing to do, and this is success, not failure
 
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        _signal_tree(pid)
     except ProcessLookupError:
         return True
     except PermissionError:
@@ -385,7 +432,7 @@ def stop_process(pid: Optional[int], expected_create_time: Optional[str], reap: 
     logger.warning("stop_process(%s): did not exit within %ss of SIGTERM, escalating to SIGKILL",
                     pid, GRACEFUL_STOP_TIMEOUT_SECONDS)
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
+        _signal_tree(pid, force=True)
     except ProcessLookupError:
         return True
     except PermissionError:
@@ -407,6 +454,8 @@ def _reap_if_ours(pid: int) -> None:
     itself has restarted since this process was started) -- ECHILD is
     expected and swallowed in that case, not an error worth surfacing.
     """
+    if IS_WINDOWS:
+        return          # no zombies on Windows
     try:
         os.waitpid(pid, os.WNOHANG)
     except ChildProcessError:
@@ -479,7 +528,7 @@ def run_one_shot(command: str, working_dir: Optional[str], env_vars: dict, log_p
         proc = subprocess.Popen(
             command, shell=True, cwd=working_dir or None, env=full_env,
             stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            **_popen_group_kwargs(),
         )
     finally:
         log_file.close()

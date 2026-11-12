@@ -56,7 +56,15 @@ def role() -> str:
 
 
 def platform() -> str:
-    return "darwin" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux") else sys.platform
+    return ("darwin" if sys.platform == "darwin" else "linux" if sys.platform.startswith("linux")
+            else "windows" if os.name == "nt" else sys.platform)
+
+
+def log_dir() -> str:
+    """Where process logs go: PROCMON_LOG_DIR, else procmon_logs in this machine's temp folder."""
+    import tempfile
+    return os.environ.get("PROCMON_LOG_DIR") or os.path.join(
+        "/tmp" if os.name != "nt" else tempfile.gettempdir(), "procmon_logs")
 
 
 # ---- paths ------------------------------------------------------------------------------------------------------------
@@ -80,7 +88,7 @@ def portable(text):
     if not text:
         return text
     r = root()
-    out = re.sub(re.escape(r) + r"(?=/|\s|$|\"|')", ROOT_TOKEN, text)
+    out = re.sub(re.escape(r) + r"(?=[/\\]|\s|$|\"|')", ROOT_TOKEN, text)
     return _BASE_PYTHONS.sub(PYTHON_TOKEN, out)
 
 
@@ -138,13 +146,13 @@ def project_dirs(command, working_dir):
     if working_dir:
         dirs.append(expand(working_dir))
     try:
-        tokens = shlex.split(expand(command or ""), posix=True)
+        tokens = shlex.split(expand(command or ""), posix=os.name != "nt")
     except ValueError:
         tokens = (expand(command or "")).split()
     for tok in tokens:
-        tok = tok.split("=", 1)[-1]                       # PYTHONPATH=/x/y style
-        if tok.startswith(r + os.sep):
-            first = tok[len(r) + 1:].split(os.sep)[0]
+        tok = tok.split("=", 1)[-1].strip('"')            # PYTHONPATH=/x/y style
+        if tok.startswith(r + os.sep) or tok.startswith(r + "/"):
+            first = re.split(r"[/\\]", tok[len(r) + 1:])[0]
             if first:
                 dirs.append(os.path.join(r, first))
     seen, out = set(), []

@@ -47,6 +47,7 @@
         <option value="" selected>Any machine</option>
         <option value="darwin" >Mac only</option>
         <option value="linux" >Linux only</option>
+        <option value="windows" >Windows only</option>
       </select>
     <div id="perpetual-options">
       <label><input type="checkbox" name="autostart" style="width:auto; display:inline;"> Autostart when procmon boots</label>
@@ -142,6 +143,7 @@
         <option value="" {% if not p.only_platform %}selected{% endif %}>Any machine</option>
         <option value="darwin" {% if p.only_platform == 'darwin' %}selected{% endif %}>Mac only</option>
         <option value="linux" {% if p.only_platform == 'linux' %}selected{% endif %}>Linux only</option>
+        <option value="windows" {% if p.only_platform == 'windows' %}selected{% endif %}>Windows only</option>
       </select>
       {% if p.run_mode == "perpetual" %}
       <label><input type="checkbox" name="autostart" {% if p.autostart %}checked{% endif %} style="width:auto; display:inline;"> Autostart when procmon boots</label>

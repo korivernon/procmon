@@ -474,7 +474,7 @@ def create_process(project_id):
         except Exception as e:
             return f"Invalid cron expression {schedule_cron!r}: {e}", 400
 
-    log_dir = os.environ.get("PROCMON_LOG_DIR", "/tmp/procmon_logs")
+    log_dir = machine.log_dir()
     with get_session() as db:
         project = _get_by_id(db, Project, project_id)
         if project is None:
