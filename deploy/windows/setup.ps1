@@ -58,16 +58,60 @@ if (-not (Test-Path (Join-Path $PgBin "pg_ctl.exe"))) {
     Expand-Archive $zip -DestinationPath $Base -Force
     Remove-Item $zip
 }
+# Postgres needs the Visual C++ runtime (msvcp140.dll ...). Installing Microsoft's redistributable needs an
+# administrator, so when Windows doesn't have it, its signed x64 DLLs are unpacked from the redistributable (its embedded
+# cabinets, opened with Windows' own expand.exe) and put next to Postgres.
+if (-not (Test-Path "$env:WINDIR\System32\msvcp140.dll") -and -not (Test-Path (Join-Path $PgBin "msvcp140.dll"))) {
+    Step "Adding the Visual C++ runtime next to Postgres"
+    $vc = Join-Path $Base "vcredist"
+    New-Item -ItemType Directory -Force -Path $vc | Out-Null
+    Invoke-WebRequest "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "$vc\vc_redist.x64.exe"
+    $carve = @'
+import struct, sys, os
+w = sys.argv[1]; d = open(os.path.join(w, "vc_redist.x64.exe"), "rb").read(); i = n = 0
+while True:
+    i = d.find(b"MSCF\x00\x00\x00\x00", i)
+    if i < 0: break
+    size = struct.unpack_from("<I", d, i + 8)[0]
+    if 0 < size <= len(d) - i:
+        open(os.path.join(w, "c%d.cab" % n), "wb").write(d[i:i + size]); n += 1; i += size
+    else:
+        i += 4
+'@
+    Set-Content -Encoding ASCII "$vc\carve.py" $carve
+    & $Py -I "$vc\carve.py" $vc
+    foreach ($cab in Get-ChildItem $vc -Filter c*.cab) {
+        $o = "$vc\out_$($cab.BaseName)"; New-Item -ItemType Directory -Force $o | Out-Null; & expand.exe -F:* $cab.FullName $o | Out-Null
+    }
+    foreach ($f in (Get-ChildItem $vc -Directory -Filter out_* | ForEach-Object { Get-ChildItem $_.FullName -File })) {
+        if ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f.FullName)[0..3]) -eq "MSCF") {
+            $o = "$vc\in_$($f.Directory.Name)_$($f.Name)"; New-Item -ItemType Directory -Force $o | Out-Null; & expand.exe -F:* $f.FullName $o | Out-Null
+        }
+    }
+    foreach ($dll in (Get-ChildItem $vc -Directory -Filter in_* | ForEach-Object { Get-ChildItem $_.FullName -File -Filter *.dll_amd64 })) {
+        $sig = Get-AuthenticodeSignature $dll.FullName
+        if ($sig.Status -eq "Valid" -and $sig.SignerCertificate.Subject -match "Microsoft Corporation") {
+            Copy-Item $dll.FullName (Join-Path $PgBin ($dll.Name -replace '_amd64$', '')) -Force
+        }
+    }
+    if (-not (Test-Path (Join-Path $PgBin "msvcp140.dll"))) { throw "Could not unpack the Visual C++ runtime" }
+}
 if (-not (Test-Path (Join-Path $PgData "PG_VERSION"))) {
     Step "Creating the database cluster (user admin, localhost only, port $PgPort)"
     & (Join-Path $PgBin "initdb.exe") -D $PgData -U admin -A trust -E UTF8 --locale=C | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "initdb failed ($LASTEXITCODE)" }
     Add-Content (Join-Path $PgData "postgresql.conf") "`nlisten_addresses = 'localhost'`nport = $PgPort`nmax_connections = 60`n"
 }
 $env:PGPORT = "$PgPort"; $env:PGHOST = "127.0.0.1"; $env:PGUSER = "admin"
 & (Join-Path $PgBin "pg_ctl.exe") -D $PgData status | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Step "Starting Postgres"
-    & (Join-Path $PgBin "pg_ctl.exe") -D $PgData -l (Join-Path $Base "postgres.log") -w start | Out-Null
+    # Started detached and waited on alone: piping pg_ctl's output would hang, because the server it starts keeps
+    # the pipe open for as long as it runs.
+    $p = Start-Process (Join-Path $PgBin "pg_ctl.exe") -PassThru -WindowStyle Hidden `
+        -ArgumentList "-D `"$PgData`" -l `"$(Join-Path $Base 'postgres.log')`" -w start"
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { throw "Postgres did not start (see $(Join-Path $Base 'postgres.log'))" }
 }
 Step "Postgres: $(& (Join-Path $PgBin 'psql.exe') -d postgres -Atc 'select version()')"
 
@@ -116,7 +160,7 @@ $start = Join-Path $Base "start-node.ps1"
 @"
 `$env:PGPORT = '$PgPort'
 & '$(Join-Path $PgBin "pg_ctl.exe")' -D '$PgData' status *> `$null
-if (`$LASTEXITCODE -ne 0) { & '$(Join-Path $PgBin "pg_ctl.exe")' -D '$PgData' -l '$(Join-Path $Base "postgres.log")' -w start *> `$null }
+if (`$LASTEXITCODE -ne 0) { (Start-Process '$(Join-Path $PgBin "pg_ctl.exe")' -PassThru -WindowStyle Hidden -ArgumentList '-D "$PgData" -l "$(Join-Path $Base "postgres.log")" -w start').WaitForExit() }
 `$procmonPy = '$(Join-Path $Root "procmon\.venv\Scripts\pythonw.exe")'
 `$running = Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" | Where-Object { `$_.CommandLine -like '*-m procmon.app*' }
 if (-not `$running -and (Test-Path `$procmonPy)) {
@@ -131,7 +175,8 @@ Step "Starts at login: $cmd"
 
 # Run it now through Task Scheduler (a one-off task in this user's name, no administrator needed), so procmon is not
 # a child of whatever ran this script and keeps running after it ends.
+$ErrorActionPreference = "Continue"            # schtasks warns on stderr that 00:00 has passed; that's expected
 schtasks /Create /F /TN "procmon-node-start" /SC ONCE /ST 00:00 /RL LIMITED `
-    /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$start`"" | Out-Null
+    /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$start`"" 2>&1 | Out-Null
 schtasks /Run /TN "procmon-node-start" | Out-Null
 Step "Done"
